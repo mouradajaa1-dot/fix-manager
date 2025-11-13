@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useRef, createContext, useContext, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
-// ... (tutti gli altri import di firebase e lucide) ...
 import { 
   getAuth, 
   onAuthStateChanged, 
   signInAnonymously,
-  signInWithCustomToken // <-- RIPRISTINATO
+  signInWithCustomToken // Mantenuto per completezza
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -24,7 +23,9 @@ import {
   limit,
   or,
   arrayUnion,
-  arrayContains
+  arrayContains,
+  serverTimestamp, // Aggiunto per date
+  writeBatch // Aggiunto per operazioni multiple
 } from 'firebase/firestore';
 import { 
   BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, 
@@ -74,12 +75,12 @@ const appId = firebaseConfig.projectId || 'default-app-id';
 
 let db;
 let auth;
-// ... (codice try/catch per initializeApp) ...
+
 try {
   const app = initializeApp(firebaseConfig);
   db = getFirestore(app);
   auth = getAuth(app);
-  // setLogLevel('debug'); 
+  // setLogLevel('debug'); // Decommenta per debug firestore
 } catch (e) {
   console.error("Errore inizializzazione Firebase:", e);
 }
@@ -87,19 +88,24 @@ try {
 // --- CONTESTO AUTENTICAZIONE ---
 const AuthContext = createContext(null);
 
+// Hook per l'autenticazione
 const useAuth = () => {
-// ... (codice interno di useAuth) ...
-  const [dbUserRef, setDbUserRef] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null); // Utente Firebase
+  const [appUser, setAppUser] = useState(null); // Utente loggato (owner, tecnico)
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [authReady, setAuthReady] = useState(false); // Per "schermata bianca"
+  const [dbUserRef, setDbUserRef] = useState(null); // Riferimento al doc utente
 
   useEffect(() => {
-    // *** MODIFICATO: Ripristinato metodo di auth per questo ambiente ***
+    // *** MODIFICATO: Forzato accesso anonimo ***
+    // L'errore 'auth/custom-token-mismatch' avveniva perché
+    // __initial_auth_token appartiene all'ambiente, ma
+    // firebaseConfig appartiene al tuo progetto. Non corrispondono.
+    // Dobbiamo forzare l'accesso anonimo al TUO progetto.
     const performAuth = async () => {
       try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
+        await signInAnonymously(auth); // Forza l'accesso anonimo
       } catch (e) {
         console.error("Errore di autenticazione:", e);
         setError("Errore di autenticazione.");
@@ -107,8 +113,6 @@ const useAuth = () => {
     };
     // --- FINE MODIFICA ---
 
-    // *** INIZIO BLOCCO CORRETTO ***
-    // Sostituito il blocco onAuthStateChanged danneggiato
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setCurrentUser(user);
@@ -128,105 +132,104 @@ const useAuth = () => {
         setCurrentUser(null);
         setAppUser(null);
       }
-      setAuthReady(true);
+      setAuthReady(true); // Segnala che l'autenticazione è completa
       setLoading(false);
     });
-    // *** FINE BLOCCO CORRETTO ***
 
-    performAuth();
-    return () => unsubscribe();
+    performAuth(); // Esegui l'accesso
+    return () => unsubscribe(); // Pulisci al unmount
   }, []);
 
   // Funzione per inizializzare gli utenti di default (OWNER + TECNICO)
   const initializeDefaultUsers = async (userId) => {
-    const ownerRef = doc(db, `artifacts/${appId}/users/${userId}/managedUsers`, 'owner');
-    const techRef = doc(db, `artifacts/${appId}/users/${userId}/managedUsers`, 'tecnico');
-    
+    const usersCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/users`);
     try {
-      const ownerDoc = await getDoc(ownerRef);
-      if (!ownerDoc.exists()) {
-        await setDoc(ownerRef, {
-          id: 'owner',
+      const snapshot = await getDocs(query(usersCollectionRef, limit(1)));
+      if (snapshot.empty) {
+        // Nessun utente, creiamo i default
+        const batch = writeBatch(db);
+        
+        // Utente Owner
+        const ownerUser = {
           username: 'owner',
-          password: 'owner', // In un'app reale, questo dovrebbe essere hashato
+          password: '123', // NB: Salvare password in chiaro non è sicuro
           role: 'Owner',
-          permissions: ['all']
-        });
-      }
-      
-      const techDoc = await getDoc(techRef);
-      if (!techDoc.exists()) {
-        await setDoc(techRef, {
-          id: 'tecnico',
+          pin: '1234'
+        };
+        batch.set(doc(usersCollectionRef, 'owner'), ownerUser);
+
+        // Utente Tecnico
+        const techUser = {
           username: 'tecnico',
-          password: 'password', // Semplice password di default
-          role: 'Technician',
-          permissions: ['view_repairs', 'edit_repairs']
-        });
+          password: '123',
+          role: 'Tecnico',
+          pin: '0000'
+        };
+        batch.set(doc(usersCollectionRef, 'tecnico'), techUser);
+
+        await batch.commit();
+        console.log("Utenti di default 'owner' e 'tecnico' creati.");
       }
     } catch (e) {
-      console.error("Errore nell'inizializzare gli utenti di default:", e);
+      console.error("Errore inizializzazione utenti di default:", e);
     }
   };
 
   // Funzione di Login
   const login = async (username, password) => {
-    if (!dbUserRef) {
-      setError("Connessione non pronta.");
-      return;
-    }
     setLoading(true);
     setError('');
     
+    if (!dbUserRef) {
+      setError("Errore: Riferimento database non pronto.");
+      setLoading(false);
+      return;
+    }
+    
+    const usersCollectionRef = collection(dbUserRef, 'users');
+    const q = query(usersCollectionRef, where("username", "==", username));
+
     try {
-      const usersCol = collection(dbUserRef, 'managedUsers');
-      const q = query(usersCol, where("username", "==", username));
       const querySnapshot = await getDocs(q);
-      
       if (querySnapshot.empty) {
-        setError("Utente non trovato.");
-        setLoading(false);
-        return;
-      }
-      
-      let userFound = null;
-      querySnapshot.forEach(doc => {
-        const userData = doc.data();
-        if (userData.password === password) { // Controllo password in chiaro (non sicuro per produzione)
-          userFound = userData;
-        }
-      });
-      
-      if (userFound) {
-        setAppUser(userFound);
-        // Salva lo stato di login
-        await setDoc(doc(dbUserRef, 'state', 'appLogin'), {
-          loggedIn: true,
-          user: userFound
-        });
+        setError('Utente non trovato.');
       } else {
-        setError("Password errata.");
+        const userDoc = querySnapshot.docs[0];
+        const userData = userDoc.data();
+        
+        if (userData.password === password) {
+          setAppUser(userData);
+          // Salva lo stato di login nel db
+          await setDoc(doc(dbUserRef, 'state', 'appLogin'), {
+            loggedIn: true,
+            user: userData,
+            lastLogin: serverTimestamp()
+          });
+        } else {
+          setError('Password errata.');
+        }
       }
     } catch (e) {
       console.error("Errore durante il login:", e);
-      setError("Si è verificato un errore.");
+      setError('Errore durante il login.');
     }
     setLoading(false);
   };
 
   // Funzione di Logout
   const logout = async () => {
-    setAppUser(null);
     if (dbUserRef) {
       try {
         await setDoc(doc(dbUserRef, 'state', 'appLogin'), {
           loggedIn: false,
-          user: null
+          user: null,
+          lastLogout: serverTimestamp()
         });
       } catch (e) {
-        console.error("Errore durante il logout:", e);
+        console.error("Errore durante il salvataggio del logout:", e);
       }
     }
+    setAppUser(null);
   };
 
   // Ritorna i valori del contesto
@@ -249,71 +252,78 @@ const LoginScreen = ({ onLogin, error, loading }) => {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
-      <div className="w-full max-w-sm p-8 bg-white rounded-lg shadow-xl">
-        <div className="flex justify-center mb-6">
-          <Wrench className="w-12 h-12 text-blue-600" />
+    <div className="flex items-center justify-center min-h-screen bg-gray-900 text-gray-100">
+      <div className="w-full max-w-md p-8 space-y-8 bg-gray-800 rounded-2xl shadow-xl">
+        <div className="text-center">
+          <Wrench className="mx-auto h-12 w-auto text-blue-400" />
+          <h2 className="mt-6 text-3xl font-extrabold text-white">
+            FixManager
+          </h2>
+          <p className="mt-2 text-sm text-gray-400">Accedi al tuo gestionale</p>
         </div>
-        <h2 className="text-2xl font-bold text-center text-gray-800 mb-4">FixManager</h2>
-        <p className="text-center text-gray-500 mb-6">Accedi al tuo gestionale</p>
-        
-        <form onSubmit={handleSubmit}>
-          <div className="mb-4">
-            <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor="username">
-              Utente
-            </label>
-            <input
-              id="username"
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="shadow-sm appearance-none border rounded w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="es. owner"
-              autoComplete="username"
-            />
-          </div>
-          <div className="mb-6">
-            <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor="password">
-              Password
-            </label>
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          <div className="rounded-md shadow-sm -space-y-px">
+            <div>
+              <label htmlFor="username" className="sr-only">Username</label>
+              <input
+                id="username"
+                name="username"
+                type="text"
+                autoComplete="username"
+                required
+                className="appearance-none rounded-none relative block w-full px-3 py-3 border border-gray-700 bg-gray-900 placeholder-gray-500 text-white rounded-t-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm"
+                placeholder="Username (es: owner)"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+            </div>
             <div className="relative">
+              <label htmlFor="password" className="sr-only">Password</label>
               <input
                 id="password"
-                type={showPassword ? 'text' : 'password'}
+                name="password"
+                type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                required
+                className="appearance-none rounded-none relative block w-full px-3 py-3 border border-gray-700 bg-gray-900 placeholder-gray-500 text-white rounded-b-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm"
+                placeholder="Password (es: 123)"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="shadow-sm appearance-none border rounded w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="************"
-                autoComplete="current-password"
               />
               <button
                 type="button"
+                className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-200"
                 onClick={() => setShowPassword(!showPassword)}
-                className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600"
-                style={{top: '-0.375rem'}} // Aggiusta allineamento verticale
               >
                 {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
               </button>
             </div>
           </div>
-          
+
           {error && (
-            <p className="text-red-500 text-sm italic text-center mb-4">{error}</p>
+            <div className="flex items-center text-red-400 bg-red-900/30 p-3 rounded-md">
+              <AlertCircle size={20} className="mr-2" />
+              <span className="text-sm">{error}</span>
+            </div>
           )}
 
-          <div className="flex items-center justify-between">
+          <div>
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg focus:outline-none focus:shadow-outline transition-colors duration-200 disabled:bg-gray-400"
+              className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 focus:ring-offset-gray-900 disabled:bg-blue-800 disabled:opacity-70"
             >
-              {loading ? 'Caricamento...' : 'Accedi'}
+              {loading ? (
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+              ) : (
+                'Accedi'
+              )}
             </button>
           </div>
         </form>
-        <p className="text-center text-xs text-gray-400 mt-8">
-          Utenti predefiniti: (owner / owner) o (tecnico / password)
-        </p>
       </div>
     </div>
   );
@@ -325,127 +335,135 @@ const LoginScreen = ({ onLogin, error, loading }) => {
 // Icone (centralizzate)
 const ICONS = {
   Dashboard: <LayoutDashboard size={20} />,
-  Repairs: <Wrench size={20} />,
-  Customers: <Users size={20} />,
-  Finance: <DollarSign size={20} />,
-  Settings: <Settings size={20} />,
-  Logout: <LogOut size={20} />,
-  Queue: <History size={20} />,
-  Working: <Wrench size={20} />, // Icona duplicata, ma con senso
-  Ready: <CheckSquare size={20} />,
-  Delivered: <Handshake size={20} />,
-  Archived: <Archive size={20} />,
-  NewRepair: <Plus size={16} />,
-  NewCustomer: <UserPlus size={16} />,
-  NewMovement: <Plus size={16} />,
-  Print: <Printer size={16} />,
-  Share: <Share2 size={16} />,
-  POS: <Receipt size={16} />,
-  Edit: <Edit size={16} />,
-  Delete: <Trash2 size={16} />,
-  Back: <ArrowLeft size={16} />,
-  Customer: <UserSquare size={16} />,
-  Device: <Smartphone size={16} />,
-  Info: <Info size={16} />,
-  Notes: <Book size={16} />,
-  Warranty: <ShieldCheck size={16} />,
-  Arrival: <Clock size={16} />,
-  Deposit: <CreditCard size={16} />,
-  Problems: <AlertCircle size={16} />,
-  Close: <X size={20} />,
-  Copy: <ClipboardCopy size={16} />,
-  Send: <Send size={16} />,
+  Riparazioni: <Wrench size={20} />,
+  Clienti: <Users size={20} />,
+  Finanze: <DollarSign size={20} />,
+  Nuovo: <Plus size={20} />,
+  Impostazioni: <Settings size={20} />,
+  Queue: <History size={16} />,
+  Working: <Wrench size={16} />,
+  Ready: <CheckSquare size={16} />,
+  Customers: <Contact size={16} />,
   Details: <FileText size={16} />,
 };
 
 // Sidebar
 const Sidebar = ({ currentView, onNavigate, onLogout, appUser }) => {
-  const navItems = [
-    { name: 'Dashboard', icon: ICONS.Dashboard },
-    { name: 'Riparazioni', icon: ICONS.Repairs },
-    { name: 'Clienti', icon: ICONS.Customers },
-    { name: 'Finanze', icon: ICONS.Finance },
-    { name: 'Impostazioni', icon: ICONS.Settings, adminOnly: true },
-  ];
+  const [isMobileOpen, setIsMobileOpen] = useState(false);
+  const isAdmin = appUser?.role === 'Owner';
 
-  const canView = (item) => {
-    if (!item.adminOnly) return true;
-    return appUser.role === 'Owner' || appUser.permissions.includes('all');
-  };
+  const NavItem = ({ view, label, icon }) => (
+    <button
+      onClick={() => {
+        onNavigate(view);
+        setIsMobileOpen(false);
+      }}
+      className={`flex items-center w-full px-4 py-3 rounded-lg transition-colors duration-200 ${
+        currentView === view
+          ? 'bg-blue-600 text-white'
+          : 'text-gray-400 hover:bg-gray-700 hover:text-white'
+      }`}
+    >
+      {icon}
+      <span className="ml-4 font-medium">{label}</span>
+    </button>
+  );
 
-  return (
-    <div className="w-64 h-screen bg-gray-900 text-gray-200 flex flex-col fixed top-0 left-0">
-      <div className="p-5 text-center border-b border-gray-700">
-        <h1 className="text-2xl font-bold text-white">FixManager</h1>
-      </div>
-      <nav className="flex-1 mt-6">
-        {navItems.filter(canView).map((item) => (
-          <a
-            key={item.name}
-            href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate(item.name);
-            }}
-            className={`flex items-center px-6 py-4 text-sm font-medium ${
-              currentView === item.name
-                ? 'bg-blue-600 text-white'
-                : 'text-gray-300 hover:bg-gray-700 hover:text-white'
-            } transition-colors duration-150`}
-          >
-            <span className="mr-3">{item.icon}</span>
-            {item.name}
-          </a>
-        ))}
-      </nav>
-      <div className="p-4 border-t border-gray-700">
-        <div className="px-2 py-2 text-sm">
-          <p className="font-semibold text-white">{appUser.username}</p>
-          <p className="text-xs text-gray-400">{appUser.role}</p>
+  const navContent = (
+    <div className="flex flex-col justify-between h-full p-4">
+      <div>
+        <div className="flex items-center mb-8 px-4">
+          <Wrench className="h-8 w-auto text-blue-400" />
+          <span className="ml-3 text-2xl font-bold text-white">FixManager</span>
         </div>
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            onLogout();
-          }}
-          className="flex items-center w-full px-6 py-4 text-sm font-medium text-red-400 hover:bg-gray-700 hover:text-red-300 rounded-md transition-colors duration-150"
+        <nav className="space-y-2">
+          <NavItem view="Dashboard" label="Dashboard" icon={ICONS.Dashboard} />
+          <NavItem view="Riparazioni" label="Riparazioni" icon={ICONS.Riparazioni} />
+          <NavItem view="Clienti" label="Clienti" icon={ICONS.Clienti} />
+          <NavItem view="Finanze" label="Finanze" icon={ICONS.Finanze} />
+          {isAdmin && (
+            <NavItem view="Impostazioni" label="Impostazioni" icon={ICONS.Impostazioni} />
+          )}
+        </nav>
+      </div>
+      
+      <div className="space-y-4">
+        <button
+          onClick={() => onNavigate('NewRepair')}
+          className="flex items-center justify-center w-full px-4 py-3 rounded-lg transition-colors duration-200 bg-blue-600 text-white hover:bg-blue-700"
         >
-          <span className="mr-3">{ICONS.Logout}</span>
-          Logout
-        </a>
+          {ICONS.Nuovo}
+          <span className="ml-3 font-medium">Nuova Riparazione</span>
+        </button>
+        <div className="border-t border-gray-700 pt-4">
+          <div className="flex items-center px-2">
+            <div className="flex-shrink-0">
+              <span className="inline-flex items-center justify-center h-10 w-10 rounded-full bg-gray-700">
+                <span className="text-sm font-medium leading-none text-white">{appUser?.username.charAt(0).toUpperCase()}</span>
+              </span>
+            </div>
+            <div className="ml-3">
+              <p className="text-sm font-medium text-white">{appUser?.username}</p>
+              <p className="text-xs font-medium text-gray-400">{appUser?.role}</p>
+            </div>
+          </div>
+          <button
+            onClick={onLogout}
+            className="flex items-center w-full px-4 py-3 mt-4 rounded-lg transition-colors duration-200 text-gray-400 hover:bg-gray-700 hover:text-white"
+          >
+            <LogOut size={20} />
+            <span className="ml-4 font-medium">Esci</span>
+          </button>
+        </div>
       </div>
     </div>
   );
-};
 
-// Header (per mobile)
-const Header = ({ onToggleSidebar }) => {
   return (
-    <div className="lg:hidden p-4 bg-white shadow-md flex justify-between items-center fixed top-0 left-0 right-0 z-10">
-      <h1 className="text-xl font-bold text-blue-600">FixManager</h1>
-      <button onClick={onToggleSidebar} className="text-gray-700">
-        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16m-7 6h7" /></svg>
+    <>
+      {/* Sidebar Desktop */}
+      <div className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0">
+        <div className="flex-1 flex flex-col min-h-0 bg-gray-900">
+          {navContent}
+        </div>
+      </div>
+      
+      {/* Mobile Menu Button */}
+      <button 
+        onClick={() => setIsMobileOpen(true)}
+        className="md:hidden fixed top-4 left-4 z-30 p-2 rounded-md bg-gray-800 text-gray-300"
+      >
+        <LayoutDashboard size={24} />
       </button>
-    </div>
+
+      {/* Mobile Sidebar (Overlay) */}
+      {isMobileOpen && (
+        <>
+          <div className="md:hidden fixed inset-0 z-40 bg-black/60" onClick={() => setIsMobileOpen(false)}></div>
+          <div className="md:hidden fixed inset-y-0 left-0 z-50 w-64 bg-gray-900 overflow-y-auto">
+            {navContent}
+          </div>
+        </>
+      )}
+    </>
   );
 };
 
 // Card Statistiche Dashboard
 const StatCard = ({ title, value, icon, color }) => {
   const colors = {
-    yellow: 'bg-yellow-100 text-yellow-600',
-    blue: 'bg-blue-100 text-blue-600',
-    green: 'bg-green-100 text-green-600',
+    yellow: "bg-yellow-500",
+    blue: "bg-blue-500",
+    green: "bg-green-500",
   };
   return (
-    <div className="bg-white p-6 rounded-lg shadow-md flex items-center">
-      <div className={`p-3 rounded-full ${colors[color]} mr-4`}>
-        {React.cloneElement(icon, { size: 24 })}
+    <div className="bg-gray-800 rounded-lg shadow p-5 flex items-center space-x-4">
+      <div className={`p-3 rounded-full ${colors[color] || 'bg-gray-500'} text-white`}>
+        {icon}
       </div>
       <div>
-        <p className="text-sm font-medium text-gray-500">{title}</p>
-        <p className="text-3xl font-bold text-gray-900">{value}</p>
+        <p className="text-sm font-medium text-gray-400">{title}</p>
+        <p className="text-2xl font-bold text-white">{value}</p>
       </div>
     </div>
   );
@@ -454,28 +472,28 @@ const StatCard = ({ title, value, icon, color }) => {
 // Lista Ticket Dashboard
 const DashboardTicketList = ({ title, tickets, icon, onNavigate }) => {
   return (
-    <div className="bg-white p-6 rounded-lg shadow-md">
+    <div className="bg-gray-800 rounded-lg shadow p-5">
       <div className="flex items-center mb-4">
-        <span className="text-blue-600 mr-2">{React.cloneElement(icon, { size: 20 })}</span>
-        <h3 className="text-lg font-semibold text-gray-800">{title} ({tickets.length})</h3>
+        {icon}
+        <h3 className="ml-2 text-lg font-semibold text-white">{title} ({tickets.length})</h3>
       </div>
       <div className="space-y-3 max-h-60 overflow-y-auto">
-        {tickets.length === 0 ? (
-          <p className="text-sm text-gray-400">Nessuna riparazione in questa lista.</p>
-        ) : (
-          tickets.slice(0, 5).map(ticket => (
-            <div 
-              key={ticket.id} 
-              className="p-3 bg-gray-50 rounded-md hover:bg-gray-100 cursor-pointer"
-              onClick={() => onNavigate('Riparazioni', ticket.id)}
+        {tickets.length > 0 ? (
+          tickets.map(ticket => (
+            <button
+              key={ticket.id}
+              onClick={() => onNavigate('RepairDetail', { ticketId: ticket.id })}
+              className="flex justify-between items-center w-full text-left p-3 bg-gray-700 rounded-md hover:bg-gray-600"
             >
-              <div className="flex justify-between items-center">
-                <span className="font-medium text-sm text-gray-700">{ticket.deviceModel}</span>
-                <span className="text-xs text-gray-500">ID: {ticket.shortId}</span>
+              <div>
+                <p className="text-sm font-medium text-white">{ticket.deviceName}</p>
+                <p className="text-xs text-gray-400">{ticket.customerName} - {ticket.problemDescription.substring(0, 30)}...</p>
               </div>
-              <p className="text-sm text-gray-600">{ticket.customerName}</p>
-            </div>
+              <ChevronRight size={16} className="text-gray-500" />
+            </button>
           ))
+        ) : (
+          <p className="text-sm text-gray-500">Nessuna riparazione in questa lista.</p>
         )}
       </div>
     </div>
@@ -484,26 +502,27 @@ const DashboardTicketList = ({ title, tickets, icon, onNavigate }) => {
 
 // Grafico Dashboard
 const FinanceChart = ({ data, loading }) => {
+  if (loading) {
+    return <div className="text-center text-gray-500">Caricamento grafico...</div>;
+  }
+  if (data.length === 0) {
+    return <div className="text-center text-gray-500">Nessun dato finanziario per questo mese.</div>;
+  }
+
   return (
-    <div className="bg-white p-6 rounded-lg shadow-md">
-      <h3 className="text-lg font-semibold text-gray-800 mb-4">Panoramica Finanziaria (Mese)</h3>
-      {loading ? (
-        <p>Caricamento...</p>
-      ) : (
-        <div className="h-60">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={data} margin={{ top: 5, right: 0, left: -20, bottom: 5 }}>
-              <XAxis dataKey="name" axisLine={false} tickLine={false} fontSize={12} />
-              <YAxis axisLine={false} tickLine={false} fontSize={12} />
-              <Tooltip cursor={{ fill: 'transparent' }} />
-              <Legend wrapperStyle={{ fontSize: "14px" }} />
-              <Bar dataKey="Entrate" fill="#10B981" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Uscite" fill="#EF4444" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </div>
+    <ResponsiveContainer width="100%" height={250}>
+      <BarChart data={data}>
+        <XAxis dataKey="name" stroke="#9CA3AF" fontSize={12} />
+        <YAxis stroke="#9CA3AF" fontSize={12} />
+        <Tooltip
+          cursor={{ fill: 'rgba(107, 114, 128, 0.3)' }}
+          contentStyle={{ backgroundColor: '#1F2937', border: 'none', borderRadius: '8px' }}
+        />
+        <Legend />
+        <Bar dataKey="Entrate" fill="#3B82F6" radius={[4, 4, 0, 0]} />
+        <Bar dataKey="Uscite" fill="#EF4444" radius={[4, 4, 0, 0]} />
+      </BarChart>
+    </ResponsiveContainer>
   );
 };
 
@@ -516,16 +535,14 @@ const useCustomers = (dbUserRef) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!dbUserRef) {
-      setLoading(false);
-      return;
-    };
-    
+    if (!dbUserRef) return;
     setLoading(true);
-    const customersCol = collection(dbUserRef, 'customers');
-    const unsubscribe = onSnapshot(customersCol, (snapshot) => {
-      const customersList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setCustomers(customersList);
+    const customersRef = collection(dbUserRef, 'customers');
+    const q = query(customersRef);
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const customersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setCustomers(customersData);
       setLoading(false);
     }, (error) => {
       console.error("Errore caricamento clienti:", error);
@@ -544,18 +561,18 @@ const useTechnicians = (dbUserRef, appUser) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!dbUserRef || appUser.role !== 'Owner') {
+    if (!dbUserRef || appUser?.role !== 'Owner') {
+      setTechnicians([]);
       setLoading(false);
       return;
     }
     
-    setLoading(true);
-    const usersCol = collection(dbUserRef, 'managedUsers');
-    const q = query(usersCol, where("role", "in", ["Technician", "Admin"]));
+    const usersRef = collection(dbUserRef, 'users');
+    const q = query(usersRef, where('role', 'in', ['Tecnico', 'Owner']));
     
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const techsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setTechnicians(techsList);
+      const techsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setTechnicians(techsData);
       setLoading(false);
     }, (error) => {
       console.error("Errore caricamento tecnici:", error);
@@ -563,7 +580,7 @@ const useTechnicians = (dbUserRef, appUser) => {
     });
 
     return () => unsubscribe();
-  }, [dbUserRef, appUser.role]);
+  }, [dbUserRef, appUser]);
 
   return { technicians, loading };
 };
@@ -574,32 +591,33 @@ const useTickets = (dbUserRef, appUser, managedUsers) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!dbUserRef) {
-      setLoading(false);
-      return;
-    }
-    
-    setLoading(true);
-    const ticketsCol = collection(dbUserRef, 'tickets');
+    if (!dbUserRef || !appUser) return;
+
+    const ticketsRef = collection(dbUserRef, 'tickets');
     let q;
 
-    if (appUser.role === 'Owner' || appUser.role === 'Admin' || appUser.permissions.includes('all')) {
-      // Owner e Admin vedono tutto
-      q = query(ticketsCol);
+    if (appUser.role === 'Owner') {
+      // Owner vede i ticket di tutti gli utenti gestiti
+      const usersToQuery = [...managedUsers.map(u => u.username), appUser.username];
+      q = query(ticketsRef, where('technician', 'in', usersToQuery));
     } else {
-      // I Tecnici vedono solo i ticket a cui sono assegnati (o quelli del loro team)
-      const visibleUsers = [appUser.id, ...managedUsers.map(u => u.id)];
-      q = query(ticketsCol, where("assignedTo", "in", visibleUsers));
+      // Tecnico vede solo i suoi
+      q = query(ticketsRef, where('technician', '==', appUser.username));
     }
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const ticketsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      // Ordina per data di arrivo (più recente prima)
-      ticketsList.sort((a, b) => new Date(b.arrivalDate) - new Date(a.arrivalDate));
-      setTickets(ticketsList);
+      const ticketsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        // Converte timestamp firestore in Date JS per ordinamento
+        createdAt: doc.data().createdAt?.toDate()
+      }));
+      // Ordina per data, più recente prima
+      ticketsData.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      setTickets(ticketsData);
       setLoading(false);
     }, (error) => {
-      console.error("Errore caricamento ticket:", error);
+      console.error("Errore caricamento tickets:", error);
       setLoading(false);
     });
 
@@ -615,25 +633,26 @@ const useFinance = (dbUserRef, appUser, managedUsers) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!dbUserRef) {
-      setLoading(false);
-      return;
-    }
-    // Solo Owner e Admin possono vedere le finanze
-    if (appUser.role !== 'Owner' && appUser.role !== 'Admin' && !appUser.permissions.includes('all')) {
-      setLoading(false);
-      return;
+    if (!dbUserRef || !appUser) return;
+    
+    const financeRef = collection(dbUserRef, 'finance');
+    let q;
+
+    if (appUser.role === 'Owner') {
+      const usersToQuery = [...managedUsers.map(u => u.username), appUser.username];
+      q = query(financeRef, where('createdBy', 'in', usersToQuery));
+    } else {
+      q = query(financeRef, where('createdBy', '==', appUser.username));
     }
     
-    setLoading(true);
-    const financeCol = collection(dbUserRef, 'finance');
-    const q = query(financeCol); // Admin/Owner vedono tutto
-
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const movementsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      // Ordina per data (più recente prima)
-      movementsList.sort((a, b) => new Date(b.date) - new Date(a.date));
-      setMovements(movementsList);
+      const data = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        date: doc.data().date?.toDate() // Converti timestamp
+      }));
+      data.sort((a, b) => (b.date || 0) - (a.date || 0)); // Ordina
+      setMovements(data);
       setLoading(false);
     }, (error) => {
       console.error("Errore caricamento finanze:", error);
@@ -641,7 +660,7 @@ const useFinance = (dbUserRef, appUser, managedUsers) => {
     });
 
     return () => unsubscribe();
-  }, [dbUserRef, appUser]);
+  }, [dbUserRef, appUser, managedUsers]);
 
   return { movements, loading };
 };
@@ -655,35 +674,37 @@ const DashboardView = ({ dbUserRef, appUser, managedUsers, onNavigate, allAdmins
   if (ticketsLoading || financeLoading || loadingCustomers) {
     return (
       <div className="flex justify-center items-center h-full">
-        <div className="loader text-gray-700">Caricamento dati dashboard...</div>
+        <svg className="animate-spin h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
       </div>
     );
   }
 
   // Calcoli Finanziari
   const now = new Date();
-  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-  
-  const monthMovements = movements.filter(m => m.date >= firstDayOfMonth);
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthMovements = movements.filter(m => m.date >= startOfMonth);
   const monthEntrate = monthMovements.filter(m => m.type === 'Entrata').reduce((acc, m) => acc + m.amount, 0);
   const monthUscite = monthMovements.filter(m => m.type === 'Uscita').reduce((acc, m) => acc + m.amount, 0);
   
-  const financeData = [
-    { name: 'Incassi', Entrate: monthEntrate },
-    { name: 'Spese', Uscite: monthUscite },
-  ];
-
   // Calcoli Riparazioni per liste
   const ticketsInAttesa = tickets.filter(t => t.status === 'In Coda');
   const ticketsInLavorazione = tickets.filter(t => t.status === 'In Lavorazione');
   const ticketsPronti = tickets.filter(t => t.status === 'Pronto per il Ritiro');
   const totalCustomers = customers.length;
   
+  // Dati Grafico
+  const financeData = [
+    { name: 'Mese Corrente', Entrate: monthEntrate, Uscite: monthUscite },
+  ];
+
   return (
     <div className="p-6">
-      <h2 className="text-2xl font-semibold text-gray-900 mb-6">Bentornato, {appUser.username}!</h2>
+      <h2 className="text-2xl font-semibold text-white mb-6">Bentornato, {appUser.username}!</h2>
       
-      {/* GRIGLIA STATS */}
+      {/* Griglia Statistiche */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         <StatCard title="In Lavorazione" value={ticketsInLavorazione.length} icon={ICONS.Working} color="yellow" />
         <StatCard title="Pronte per Ritiro" value={ticketsPronti.length} icon={ICONS.Ready} color="blue" />
@@ -692,17 +713,26 @@ const DashboardView = ({ dbUserRef, appUser, managedUsers, onNavigate, allAdmins
 
       {/* Layout a 2 colonne */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Colonna Sinistra - Finanze */}
-          <FinanceChart data={financeData} loading={financeLoading} />
-          
-          {/* Colonna Destra - Liste Ticket */}
+        
+        {/* Colonna Sinistra */}
+        <div className="space-y-6">
+          {/* Grafico Finanziario */}
+          <div className="bg-gray-800 rounded-lg shadow p-5">
+            <h3 className="text-lg font-semibold text-white mb-4">Finanze (Mese Corrente)</h3>
+            <FinanceChart data={financeData} loading={financeLoading} />
+          </div>
+        </div>
+
+        {/* Colonna Destra */}
           <div className="space-y-6">
+               {/* Lista "In Coda" */}
                <DashboardTicketList
-                title="In Coda (Ultime 5)"
+                title="In Coda"
                 tickets={ticketsInAttesa}
                 icon={ICONS.Queue}
                 onNavigate={onNavigate}
                />
+               {/* Lista "Pronte" */}
                <DashboardTicketList
                 title="Pronte per il Ritiro"
                 tickets={ticketsPronti}
@@ -721,51 +751,42 @@ const DashboardView = ({ dbUserRef, appUser, managedUsers, onNavigate, allAdmins
 
 // Componente di ricerca e filtri
 const RepairFilters = ({ filters, onFilterChange, onSearch, technicians, appUser }) => {
-  const statusOptions = [
-    { value: 'all', label: 'Tutti gli Stati' },
-    { value: 'In Coda', label: 'In Coda' },
-    { value: 'In Lavorazione', label: 'In Lavorazione' },
-    { value: 'Pronto per il Ritiro', label: 'Pronto per Ritiro' },
-    { value: 'Consegnato', label: 'Consegnato' },
-    { value: 'Archiviato', label: 'Archiviato' },
-  ];
-
   return (
-    <div className="mb-4 p-4 bg-gray-50 rounded-lg">
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {/* Ricerca */}
-        <input
-          type="text"
-          placeholder="Cerca ID, cliente, modello..."
-          className="p-2 border rounded-md"
-          onChange={(e) => onSearch(e.target.value)}
-        />
-        
-        {/* Filtro Stato */}
+    <div className="flex flex-wrap gap-4 mb-6">
+      <input
+        type="text"
+        placeholder="Cerca per nome, dispositivo, ID..."
+        className="flex-grow bg-gray-700 text-white placeholder-gray-400 px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+        onChange={(e) => onSearch(e.target.value)}
+      />
+      <select
+        name="status"
+        value={filters.status}
+        onChange={onFilterChange}
+        className="bg-gray-700 text-white px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >
+        <option value="">Tutti gli stati</option>
+        <option value="In Coda">In Coda</option>
+        <option value="In Lavorazione">In Lavorazione</option>
+        <option value="Preventivo">Preventivo</option>
+        <option value="Pronto per il Ritiro">Pronto per il Ritiro</option>
+        <option value="Completato">Completato</option>
+        <option value="Non Riparabile">Non Riparabile</option>
+      </select>
+      
+      {appUser.role === 'Owner' && (
         <select
-          value={filters.status}
-          onChange={(e) => onFilterChange('status', e.target.value)}
-          className="p-2 border rounded-md bg-white"
+          name="technician"
+          value={filters.technician}
+          onChange={onFilterChange}
+          className="bg-gray-700 text-white px-4 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
-          {statusOptions.map(opt => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          <option value="">Tutti i tecnici</option>
+          {technicians.map(tech => (
+            <option key={tech.id} value={tech.username}>{tech.username}</option>
           ))}
         </select>
-        
-        {/* Filtro Tecnico (Solo per Admin/Owner) */}
-        {(appUser.role === 'Owner' || appUser.role === 'Admin') && (
-          <select
-            value={filters.technician}
-            onChange={(e) => onFilterChange('technician', e.target.value)}
-            className="p-2 border rounded-md bg-white"
-          >
-            <option value="all">Tutti i Tecnici</option>
-            {technicians.map(tech => (
-              <option key={tech.id} value={tech.id}>{tech.username}</option>
-            ))}
-          </select>
-        )}
-      </div>
+      )}
     </div>
   );
 };
@@ -773,126 +794,116 @@ const RepairFilters = ({ filters, onFilterChange, onSearch, technicians, appUser
 // Tabella Riparazioni
 const RepairTable = ({ tickets, onRowClick, getStatusClass, getCustomerName }) => {
   return (
-    <div className="bg-white shadow-md rounded-lg overflow-x-auto">
-      <table className="min-w-full divide-y divide-gray-200">
-        <thead className="bg-gray-50">
-          <tr>
-            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
-            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Cliente</th>
-            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Dispositivo</th>
-            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stato</th>
-            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Data Arrivo</th>
-          </tr>
-        </thead>
-        <tbody className="bg-white divide-y divide-gray-200">
-          {tickets.map(ticket => (
-            <tr key={ticket.id} onClick={() => onRowClick(ticket.id)} className="hover:bg-gray-50 cursor-pointer">
-              <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">{ticket.shortId}</td>
-              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{getCustomerName(ticket.customerId)}</td>
-              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{ticket.deviceModel}</td>
-              <td className="px-6 py-4 whitespace-nowrap">
-                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusClass(ticket.status)}`}>
-                  {ticket.status}
-                </span>
-              </td>
-              <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{new Date(ticket.arrivalDate).toLocaleDateString()}</td>
+    <div className="bg-gray-800 rounded-lg shadow overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead className="bg-gray-700/50">
+            <tr>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">ID</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Cliente</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Dispositivo</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Tecnico</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Stato</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Prezzo</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody className="bg-gray-800 divide-y divide-gray-700">
+            {tickets.map(ticket => (
+              <tr key={ticket.id} onClick={() => onRowClick(ticket.id)} className="hover:bg-gray-700 cursor-pointer">
+                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-white">{ticket.ticketId}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{getCustomerName(ticket.customerId)}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{ticket.deviceName}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{ticket.technician}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                  <span className={`px-3 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusClass(ticket.status)}`}>
+                    {ticket.status}
+                  </span>
+                </td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">€{ticket.price.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {tickets.length === 0 && (
+         <p className="text-center text-gray-500 py-10">Nessuna riparazione trovata.</p>
+      )}
     </div>
   );
 };
 
 // Vista Principale Riparazioni
 const RepairView = ({ dbUserRef, appUser, onNavigate, technicians, allAdmins, customers, loadingCustomers }) => {
-  const { tickets, loading: ticketsLoading } = useTickets(dbUserRef, appUser, allAdmins); // Usa allAdmins per hook
-  
+  const { tickets, loading } = useTickets(dbUserRef, appUser, allAdmins);
   const [searchTerm, setSearchTerm] = useState('');
-  const [filters, setFilters] = useState({
-    status: 'all',
-    technician: 'all',
-  });
+  const [filters, setFilters] = useState({ status: '', technician: '' });
 
-  // Funzione per ottenere il nome del cliente (memoizzata)
-  const getCustomerName = useMemo(() => {
-    const customerMap = new Map(customers.map(c => [c.id, c.name]));
-    return (customerId) => customerMap.get(customerId) || 'Cliente Sconosciuto';
-  }, [customers]);
-  
-  // Funzione per colore stato
-  const getStatusClass = (status) => {
-    switch (status) {
-      case 'In Coda': return 'bg-yellow-100 text-yellow-800';
-      case 'In Lavorazione': return 'bg-blue-100 text-blue-800';
-      case 'Pronto per il Ritiro': return 'bg-green-100 text-green-800';
-      case 'Consegnato': return 'bg-gray-100 text-gray-800';
-      case 'Archiviato': return 'bg-purple-100 text-purple-800';
-      default: return 'bg-gray-100 text-gray-800';
-    }
+  const handleFilterChange = (e) => {
+    setFilters(prev => ({ ...prev, [e.target.name]: e.target.value }));
   };
-
-  const handleFilterChange = (key, value) => {
-    setFilters(prev => ({ ...prev, [key]: value }));
+  
+  const getCustomerName = (customerId) => {
+    const customer = customers.find(c => c.id === customerId);
+    return customer ? customer.name : 'Sconosciuto';
   };
 
   const filteredTickets = useMemo(() => {
     return tickets.filter(ticket => {
-      const searchMatch = searchTerm.length < 2 || 
-        (ticket.shortId && ticket.shortId.toLowerCase().includes(searchTerm.toLowerCase())) ||
-        (getCustomerName(ticket.customerId).toLowerCase().includes(searchTerm.toLowerCase())) ||
-        (ticket.deviceModel && ticket.deviceModel.toLowerCase().includes(searchTerm.toLowerCase())) ||
-        (ticket.imei && ticket.imei.toLowerCase().includes(searchTerm.toLowerCase()));
+      const customerName = getCustomerName(ticket.customerId).toLowerCase();
+      const search = searchTerm.toLowerCase();
+      
+      const matchesSearch = 
+        customerName.includes(search) ||
+        ticket.deviceName.toLowerCase().includes(search) ||
+        ticket.ticketId.toLowerCase().includes(search) ||
+        ticket.problemDescription.toLowerCase().includes(search);
         
-      const statusMatch = filters.status === 'all' || ticket.status === filters.status;
+      const matchesStatus = filters.status ? ticket.status === filters.status : true;
+      const matchesTechnician = filters.technician ? ticket.technician === filters.technician : true;
       
-      const techMatch = filters.technician === 'all' || ticket.assignedTo === filters.technician;
-      
-      return searchMatch && statusMatch && techMatch;
+      return matchesSearch && matchesStatus && matchesTechnician;
     });
-  }, [tickets, searchTerm, filters, getCustomerName]);
+  }, [tickets, searchTerm, filters, customers]);
 
-  if (ticketsLoading || loadingCustomers) {
-    return (
+  const getStatusClass = (status) => {
+    switch (status) {
+      case 'In Coda': return 'bg-gray-600 text-gray-100';
+      case 'In Lavorazione': return 'bg-yellow-600 text-yellow-100';
+      case 'Preventivo': return 'bg-purple-600 text-purple-100';
+      case 'Pronto per il Ritiro': return 'bg-blue-600 text-blue-100';
+      case 'Completato': return 'bg-green-600 text-green-100';
+      case 'Non Riparabile': return 'bg-red-600 text-red-100';
+      default: return 'bg-gray-600 text-gray-100';
+    }
+  };
+
+  if (loading || loadingCustomers) {
+     return (
       <div className="flex justify-center items-center h-full">
-        <div className="loader text-gray-700">Caricamento riparazioni...</div>
+        <svg className="animate-spin h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
       </div>
     );
   }
 
   return (
     <div className="p-6">
-      <div className="flex justify-between items-center mb-4">
-        <h2 className="text-2xl font-semibold text-gray-900">Gestione Riparazioni</h2>
-        <button
-          onClick={() => onNavigate('Nuova Riparazione')}
-          className="flex items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition-colors"
-        >
-          {ICONS.NewRepair}
-          <span className="ml-2">Nuova Riparazione</span>
-        </button>
-      </div>
-      
-      <RepairFilters
+      <h2 className="text-2xl font-semibold text-white mb-6">Tutte le Riparazioni</h2>
+      <RepairFilters 
         filters={filters}
         onFilterChange={handleFilterChange}
         onSearch={setSearchTerm}
         technicians={technicians}
         appUser={appUser}
       />
-      
-      {filteredTickets.length > 0 ? (
-        <RepairTable
-          tickets={filteredTickets}
-          onRowClick={(id) => onNavigate('Riparazioni', id)}
-          getStatusClass={getStatusClass}
-          getCustomerName={getCustomerName}
-        />
-      ) : (
-        <div className="text-center p-10 bg-white rounded-lg shadow-md">
-          <p className="text-gray-500">Nessuna riparazione trovata con questi filtri.</p>
-        </div>
-      )}
+      <RepairTable
+        tickets={filteredTickets}
+        onRowClick={(ticketId) => onNavigate('RepairDetail', { ticketId })}
+        getStatusClass={getStatusClass}
+        getCustomerName={getCustomerName}
+      />
     </div>
   );
 };
@@ -905,85 +916,70 @@ const PrintModal = ({ isOpen, onClose, ticket, customer, appUser }) => {
   const printRef = useRef();
 
   const handlePrint = () => {
-    const content = printRef.current.innerHTML;
-    const pwin = window.open('', '_blank', 'width=800,height=600');
-    pwin.document.open();
-    pwin.document.write(`
-      <html>
-        <head>
-          <title>Stampa Riparazione ${ticket.shortId}</title>
-          <style>
-            body { font-family: Arial, sans-serif; line-height: 1.5; font-size: 10pt; }
-            .printable-content { width: 90%; margin: 0 auto; padding: 20px; }
-            h2 { text-align: center; border-bottom: 2px solid #000; padding-bottom: 10px; }
-            .section { margin-bottom: 20px; border-bottom: 1px dashed #ccc; padding-bottom: 10px; }
-            .section h3 { font-size: 12pt; margin-bottom: 10px; border-bottom: 1px solid #eee; }
-            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-            .grid-item { }
-            .grid-item strong { display: block; font-size: 9pt; color: #555; }
-            .grid-item span { font-size: 11pt; }
-            .notes { border: 1px solid #ccc; padding: 10px; min-height: 50px; background: #f9f9f9; }
-            .footer { text-align: center; font-size: 9pt; margin-top: 30px; }
-            .signature { font-size: 6px; color: #D1D5DB; padding-top: 1rem; text-align: center; }
-          </style>
-        </head>
-        <body onload="window.print(); window.close();">
-          ${content}
-        </body>
-      </html>
-    `);
-    pwin.document.close();
+    const printContent = printRef.current.innerHTML;
+    const originalContent = document.body.innerHTML;
+    document.body.innerHTML = printContent;
+    window.print();
+    document.body.innerHTML = originalContent;
+    window.location.reload(); // Ricarica per ripristinare lo stato
   };
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 z-40 flex justify-center items-center p-4">
-      <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-semibold">Stampa Ingresso</h3>
-          <button onClick={onClose}>{ICONS.Close}</button>
-        </div>
+    <div className="fixed inset-0 bg-black/70 z-50 flex justify-center items-center p-4">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-lg p-6 relative">
+        <button onClick={onClose} className="absolute top-3 right-3 text-gray-400 hover:text-white">
+          <X size={24} />
+        </button>
+        <h3 className="text-xl font-semibold text-white mb-4">Stampa Scheda</h3>
         
         {/* Contenuto Stampabile */}
-        <div ref={printRef} className="printable-content text-black">
-          <h2>Riparazione #{ticket.shortId}</h2>
-          
-          <div className="section">
-            <h3>Cliente e Dispositivo</h3>
-            <div className="grid">
-              <div className="grid-item"><strong>Cliente:</strong> <span>{customer?.name || 'N/D'}</span></div>
-              <div className="grid-item"><strong>Telefono:</strong> <span>{customer?.phone || 'N/D'}</span></div>
-              <div className="grid-item"><strong>Modello:</strong> <span>{ticket.deviceModel || 'N/D'}</span></div>
-              <div className="grid-item"><strong>IMEI/Seriale:</strong> <span>{ticket.imei || 'N/D'}</span></div>
+        <div ref={printRef} className="printable-content p-4 text-black bg-white rounded">
+          <style type="text/css" media="print">
+            {`
+              @page { size: auto; margin: 20mm; }
+              body { background-color: #fff; }
+              .printable-content { color: #000; }
+              .signature { font-size: 6px !important; color: #D1D5DB !important; padding-top: 1rem !important; text-align: center !important; }
+            `}
+          </style>
+          <h2 className="text-xl font-bold text-center mb-4">FixManager - Scheda Riparazione</h2>
+          <div className="text-center text-xs mb-4">
+            <p className="font-bold">ID Ticket: {ticket.ticketId}</p>
+            <p>Data: {new Date(ticket.createdAt).toLocaleDateString()}</p>
+          </div>
+          <div className="border-t border-b border-gray-300 py-4 my-4">
+            <h3 className="font-bold mb-2">Cliente:</h3>
+            <p>{customer?.name || 'Non specificato'}</p>
+            <p>{customer?.phone || 'Nessun telefono'}</p>
+            <p>{customer?.email || 'Nessuna email'}</p>
+          </div>
+          <div className="border-b border-gray-300 pb-4 mb-4">
+            <h3 className="font-bold mb-2">Dispositivo:</h3>
+            <p>{ticket.deviceName}</p>
+            <p>SN/IMEI: {ticket.imei || 'N/D'}</p>
+            <p>Password: {ticket.password || 'N/D'}</p>
+          </div>
+          <div className="border-b border-gray-300 pb-4 mb-4">
+            <h3 className="font-bold mb-2">Problema Segnalato:</h3>
+            <p>{ticket.problemDescription}</p>
+          </div>
+          <div>
+            <h3 className="font-bold mb-2">Note Tecnico:</h3>
+            <div className="h-20 border border-gray-300 rounded p-1">
+              {ticket.notes || ''}
             </div>
           </div>
-          
-          <div className="section">
-            <h3>Dettagli Riparazione</h3>
-            <div className="grid">
-              <div className="grid-item"><strong>Data Arrivo:</strong> <span>{new Date(ticket.arrivalDate).toLocaleString()}</span></div>
-              <div className="grid-item"><strong>Acconto:</strong> <span>€{ticket.deposit || 0}</span></div>
-              <div className="grid-item"><strong>Preventivo:</strong> <span>€{ticket.price || 0}</span></div>
-              <div className="grid-item"><strong>Tecnico:</strong> <span>{ticket.assignedTo || 'Non assegnato'}</span></div>
-            </div>
+          <div className="text-right font-bold text-lg mt-4">
+            <p>Prezzo: €{ticket.price.toFixed(2)}</p>
           </div>
-          
-          <div className="section">
-            <h3>Problema Segnalato</h3>
-            <p className="notes">{ticket.problem || 'Nessun problema segnalato.'}</p>
-          </div>
-          
-          <div className="section">
-            <h3>Note Interne</h3>
-            <p className="notes">{ticket.internalNotes || 'Nessuna nota interna.'}</p>
-          </div>
-          
-          <div className="footer">
+          <div className="mt-8 text-center text-xs">
             <p>Grazie per averci scelto. Conservare questo buono per il ritiro.</p>
-            <p style={{fontWeight: 'bold', marginTop: '8px'}}>FixManager</p>
+            <p className="font-bold mt-2">FixManager</p>
           </div>
-          <div className="signature">
+          {/* FIRMA DEVELOPER */}
+          <div className="signature" style={{ fontSize: '6px', color: '#D1D5DB', paddingTop: '1rem', textAlign: 'center' }}>
             {appUser?.username || 'FixManager'}
           </div>
         </div>
@@ -991,10 +987,10 @@ const PrintModal = ({ isOpen, onClose, ticket, customer, appUser }) => {
         
         <button
           onClick={handlePrint}
-          className="mt-6 w-full flex justify-center items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"
+          className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center justify-center"
         >
-          {ICONS.Print}
-          <span className="ml-2">Stampa</span>
+          <Printer size={20} className="mr-2" />
+          Stampa
         </button>
       </div>
     </div>
@@ -1005,102 +1001,103 @@ const PrintModal = ({ isOpen, onClose, ticket, customer, appUser }) => {
 const PosModal = ({ isOpen, onClose, ticket, customer, appUser }) => {
   const printRef = useRef();
 
-  const handlePrintPos = () => {
-    const content = printRef.current.innerHTML;
-    const pwin = window.open('', '_blank', 'width=300,height=500'); // Dimensione tipica scontrino
-    pwin.document.open();
-    pwin.document.write(`
-      <html>
-        <head>
-          <title>Scontrino ${ticket.shortId}</title>
-          <style>
-            body { 
-              font-family: 'Courier New', Courier, monospace; 
-              font-size: 10pt; 
-              line-height: 1.4;
-              width: 280px; /* Larghezza scontrino 80mm */
-              margin: 0;
-              padding: 10px;
-            }
-            .printable-content { width: 100%; }
-            h2 { font-size: 12pt; text-align: center; margin: 0; }
-            .header { text-align: center; font-size: 9pt; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px; }
-            .section { margin-bottom: 10px; }
-            .item-list { border-top: 1px dashed #000; border-bottom: 1px dashed #000; padding: 10px 0; }
-            .item { display: flex; justify-content: space-between; }
-            .item .name { width: 70%; }
-            .item .price { width: 30%; text-align: right; }
-            .totals { margin-top: 10px; }
-            .total-row { display: flex; justify-content: space-between; font-weight: bold; }
-            .footer { text-align: center; font-size: 9pt; margin-top: 20px; border-top: 1px dashed #000; padding-top: 10px; }
-            .signature { font-size: 6px; color: #333; padding-top: 1rem; text-align: center; }
-          </style>
-        </head>
-        <body onload="window.print(); window.close();">
-          ${content}
-        </body>
-      </html>
-    `);
-    pwin.document.close();
+  const handlePrint = () => {
+    const printContent = printRef.current.innerHTML;
+    const originalContent = document.body.innerHTML;
+    
+    // Stile per simulare scontrino
+    const printStyles = `
+      <style>
+        @page { 
+          size: 80mm auto; /* Larghezza scontrino 80mm */
+          margin: 0;
+        }
+        body { 
+          margin: 0; 
+          padding: 10px;
+          background-color: #fff; 
+          font-family: 'Courier New', Courier, monospace;
+          line-height: 1.4;
+        }
+        .printable-content { 
+          width: 100%;
+          color: #000; 
+          font-size: 10px;
+        }
+        .signature { 
+          font-size: 6px !important; 
+          color: #888 !important; 
+          padding-top: 1rem !important; 
+          text-align: center !important; 
+        }
+        h2, h3, p { margin: 0; }
+        .text-center { text-align: center; }
+        .font-bold { font-weight: bold; }
+        .mb-2 { margin-bottom: 0.5rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .mt-4 { margin-top: 1rem; }
+        .mt-8 { margin-top: 2rem; }
+        .text-xl { font-size: 1.25rem; }
+        .text-xs { font-size: 0.75rem; }
+        .text-lg { font-size: 1.125rem; }
+        .border-t { border-top: 1px dashed #000; }
+        .border-b { border-bottom: 1px dashed #000; }
+        .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+      </style>
+    `;
+    
+    document.body.innerHTML = printStyles + printContent;
+    window.print();
+    document.body.innerHTML = originalContent;
+    window.location.reload(); // Ricarica per ripristinare lo stato
   };
 
   if (!isOpen) return null;
-  
-  const price = ticket.price || 0;
-  const deposit = ticket.deposit || 0;
-  const toPay = price - deposit;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 z-40 flex justify-center items-center p-4">
-      <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-sm">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-semibold">Stampa Scontrino (POS)</h3>
-          <button onClick={onClose}>{ICONS.Close}</button>
-        </div>
+    <div className="fixed inset-0 bg-black/70 z-50 flex justify-center items-center p-4">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-xs p-6 relative">
+        <button onClick={onClose} className="absolute top-3 right-3 text-gray-400 hover:text-white">
+          <X size={24} />
+        </button>
+        <h3 className="text-xl font-semibold text-white mb-4">Stampa Scontrino</h3>
         
-        {/* Contenuto Stampabile (Stile Scontrino) */}
-        <div ref={printRef} className="printable-content p-4 text-black bg-gray-50 border">
-          <h2 className="text-xl font-bold text-center mb-4">FixManager</h2>
-          <div className="header text-center text-xs mb-4">
+        {/* Contenuto Stampabile (simulazione scontrino) */}
+        <div ref={printRef} className="printable-content p-4 text-black bg-white rounded">
+          <h2 className="text-xl font-bold text-center mb-2">FixManager</h2>
+          <div className="text-center text-xs mb-4">
             <p>FixManager di {appUser?.username || 'Admin'}</p>
             <p>Via Roma 1, 12345 Città</p>
             <p>P.IVA 1234567890</p>
+            <p>{new Date().toLocaleString()}</p>
           </div>
           
-          <div className="section text-xs">
-            <p>Scontrino per Riparazione: #{ticket.shortId}</p>
+          <div className="border-t border-b py-2 mb-2">
+            <p>Riparazione: {ticket.deviceName}</p>
+            <p>ID Ticket: {ticket.ticketId}</p>
             <p>Cliente: {customer?.name || 'N/D'}</p>
-            <p>Data: {new Date().toLocaleString()}</p>
-          </div>
-
-          <div className="item-list text-xs my-4">
-            <div className="item">
-              <span className="name">Riparazione: {ticket.deviceModel}</span>
-              <span className="price">€{price.toFixed(2)}</span>
-            </div>
-            {/* Qui si potrebbero aggiungere parti di ricambio se tracciate */}
           </div>
           
-          <div className="totals text-sm">
-            <div className="total-row">
-              <span>Totale:</span>
-              <span>€{price.toFixed(2)}</span>
-            </div>
-            <div className="total-row">
-              <span>Acconto Versato:</span>
-              <span>-€{deposit.toFixed(2)}</span>
-            </div>
-            <hr className="my-1 border-dashed border-black" />
-            <div className="total-row text-base">
-              <span>DA PAGARE:</span>
-              <span>€{toPay.toFixed(2)}</span>
-            </div>
+          <div className="mb-4">
+            <p className="flex justify-between">
+              <span>Totale Riparazione</span>
+              <span className="font-bold">€{ticket.price.toFixed(2)}</span>
+            </p>
+            <p className="flex justify-between">
+              <span>IVA (22%)</span>
+              <span className="font-bold">€{(ticket.price - (ticket.price / 1.22)).toFixed(2)}</span>
+            </p>
           </div>
           
-          <div className="footer text-center text-xs mt-8">
+          <div className="border-t pt-2 text-right font-bold text-lg">
+            <p>TOTALE: €{ticket.price.toFixed(2)}</p>
+          </div>
+          
+          <div className="mt-8 text-center text-xs">
             <p>Grazie per aver scelto {appUser?.username || 'FixManager'}!</p>
             <p className="font-bold mt-2">FixManager</p>
           </div>
+           {/* FIRMA DEVELOPER */}
           <div className="signature" style={{ fontSize: '6px', color: '#D1D5DB', paddingTop: '1rem', textAlign: 'center' }}>
             {appUser?.username || 'FixManager'}
           </div>
@@ -1108,119 +1105,104 @@ const PosModal = ({ isOpen, onClose, ticket, customer, appUser }) => {
         {/* Fine contenuto stampabile */}
         
         <button
-          onClick={handlePrintPos}
-          className="mt-6 w-full flex justify-center items-center bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg"
+          onClick={handlePrint}
+          className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg flex items-center justify-center"
         >
-          {ICONS.Print}
-          <span className="ml-2">Stampa Scontrino</span>
+          <Receipt size={20} className="mr-2" />
+          Stampa Scontrino
         </button>
       </div>
     </div>
   );
 };
 
-
 // Modal Condivisione
 const ShareModal = ({ isOpen, onClose, ticket, customer }) => {
-  const [message, setMessage] = useState('');
-  const [notifType, setNotifType] = useState('ready'); // 'ready' o 'quote'
+  const [copySuccess, setCopySuccess] = useState('');
+  const [phone, setPhone] = useState(customer?.phone || '');
   
-  const readyMessage = `FixManager: Gentile ${customer?.name || 'Cliente'}, la sua riparazione (ID: ${ticket.shortId}, ${ticket.deviceModel}) è pronta per il ritiro. Costo totale: €${ticket.price || 0}. Saluti.`;
-  const quoteMessage = `FixManager: Gentile ${customer?.name || 'Cliente'}, il preventivo per la sua riparazione (ID: ${ticket.shortId}, ${ticket.deviceModel}) è di €${ticket.price || 0}. Attendiamo conferma. Saluti.`;
+  const ticketUrl = `${window.location.origin}/ticket-status/${ticket.id}`;
+  const whatsappMessage = encodeURIComponent(`Ciao ${customer?.name}, la tua riparazione (ID: ${ticket.ticketId}) è ${ticket.status}. Controlla i dettagli: ${ticketUrl}`);
+  const whatsappUrl = `https://wa.me/${phone}?text=${whatsappMessage}`;
   
-  useEffect(() => {
-    if (isOpen) {
-      setMessage(notifType === 'ready' ? readyMessage : quoteMessage);
-    }
-  }, [isOpen, notifType, customer, ticket]);
+  const smsMessage = encodeURIComponent(`FixManager: Ciao ${customer?.name}, la tua riparazione (ID: ${ticket.ticketId}) è ${ticket.status}. Dettagli: ${ticketUrl}`);
+  const smsUrl = `sms:${phone}?body=${smsMessage}`;
 
   const copyToClipboard = () => {
-    // Usa document.execCommand per compatibilità iframe
-    const ta = document.createElement('textarea');
-    ta.value = message;
-    document.body.appendChild(ta);
-    ta.select();
+    // Usa un trucco per 'document.execCommand'
+    const textArea = document.createElement("textarea");
+    textArea.value = ticketUrl;
+    textArea.style.position = "fixed"; // Evita lo scroll
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
     try {
       document.execCommand('copy');
+      setCopySuccess('Link copiato!');
+      setTimeout(() => setCopySuccess(''), 2000);
     } catch (err) {
-      console.error('Errore nel copiare:', err);
+      setCopySuccess('Errore nel copiare.');
     }
-    document.body.removeChild(ta);
+    document.body.removeChild(textArea);
   };
-  
-  const getWhatsAppLink = () => {
-    const phone = customer?.phone?.replace(/\s+/g, ''); // Rimuovi spazi
-    if (!phone) return '#';
-    return `https_//wa.me/${phone}?text=${encodeURIComponent(message)}`;
-    // Sostituito https con https_ per evitare problemi di link
-  };
-  
-  const getSmsLink = () => {
-    const phone = customer?.phone?.replace(/\s+/g, '');
-    if (!phone) return '#';
-    return `sms:${phone}?body=${encodeURIComponent(message)}`;
-  };
-
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 z-40 flex justify-center items-center p-4">
-      <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-lg">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-semibold">Notifica Cliente</h3>
-          <button onClick={onClose}>{ICONS.Close}</button>
-        </div>
+    <div className="fixed inset-0 bg-black/70 z-50 flex justify-center items-center p-4">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-md p-6 relative">
+        <button onClick={onClose} className="absolute top-3 right-3 text-gray-400 hover:text-white">
+          <X size={24} />
+        </button>
+        <h3 className="text-xl font-semibold text-white mb-6">Condividi Stato Riparazione</h3>
         
-        <div className="mb-4">
-          <label className="block text-sm font-medium text-gray-700 mb-2">Tipo Notifica:</label>
-          <select 
-            value={notifType} 
-            onChange={(e) => setNotifType(e.target.value)}
-            className="w-full p-2 border rounded-md bg-white"
-          >
-            <option value="ready">Pronto per il Ritiro</option>
-            <option value="quote">Preventivo Pronto</option>
-          </select>
+        <div className="space-y-4">
+          <label className="block text-sm font-medium text-gray-400">Link Pubblico</label>
+          <div className="flex">
+            <input
+              type="text"
+              readOnly
+              value={ticketUrl}
+              className="flex-1 bg-gray-900 text-gray-300 px-3 py-2 rounded-l-md border border-gray-700 focus:outline-none"
+            />
+            <button
+              onClick={copyToClipboard}
+              className="px-4 py-2 bg-blue-600 text-white rounded-r-md hover:bg-blue-700"
+            >
+              <ClipboardCopy size={20} />
+            </button>
+          </div>
+          {copySuccess && <p className="text-xs text-green-400">{copySuccess}</p>}
+
+          <div className="pt-4 border-t border-gray-700">
+            <label htmlFor="phone" className="block text-sm font-medium text-gray-400 mb-2">Numero di Telefono (per WA/SMS)</label>
+            <input
+              id="phone"
+              type="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="Es: 393331234567"
+              className="w-full bg-gray-900 text-gray-300 px-3 py-2 rounded-md border border-gray-700 focus:outline-none"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <a
+              href={phone ? whatsappUrl : '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`flex items-center justify-center p-3 rounded-lg ${phone ? 'bg-green-600 hover:bg-green-700' : 'bg-gray-600 opacity-50 cursor-not-allowed'}`}
+            >
+              <Send size={20} className="mr-2" /> WhatsApp
+            </a>
+            <a
+              href={phone ? smsUrl : '#'}
+              className={`flex items-center justify-center p-3 rounded-lg ${phone ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-600 opacity-50 cursor-not-allowed'}`}
+            >
+              <Mail size={20} className="mr-2" /> SMS
+            </a>
+          </div>
         </div>
-        
-        <div className="mb-4">
-          <label className="block text-sm font-medium text-gray-700 mb-2">Messaggio:</label>
-          <textarea
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            rows="5"
-            className="w-full p-2 border rounded-md bg-gray-50"
-          ></textarea>
-        </div>
-        
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={copyToClipboard}
-            className="flex-1 flex items-center justify-center bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-lg"
-          >
-            {ICONS.Copy} <span className="ml-2">Copia</span>
-          </button>
-          <a
-            href={getWhatsAppLink()}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 flex items-center justify-center bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg"
-            // onClick in caso di link https_
-            onClick={(e) => { 
-              e.target.href = e.target.href.replace('https_', 'https://');
-            }}
-          >
-            {ICONS.Send} <span className="ml-2">WhatsApp</span>
-          </a>
-          <a
-            href={getSmsLink()}
-            className="flex-1 flex items-center justify-center bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg"
-          >
-            {ICONS.Send} <span className="ml-2">SMS</span>
-          </a>
-        </div>
-        
       </div>
     </div>
   );
@@ -1231,321 +1213,239 @@ const ShareModal = ({ isOpen, onClose, ticket, customer }) => {
 const RepairDetailView = ({ ticketId, onNavigate, dbUserRef, appUser, customers, technicians, showNotify, settings }) => {
   const [ticket, setTicket] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [customer, setCustomer] = useState(null);
-  const [editData, setEditData] = useState({});
-  const [isEditing, setIsEditing] = useState(false);
-  
-  // Stati dei Modal
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isPosModalOpen, setIsPosModalOpen] = useState(false);
   
-  const ticketRef = useMemo(() => doc(dbUserRef, 'tickets', ticketId), [dbUserRef, ticketId]);
+  const customer = useMemo(() => {
+    if (!ticket || !customers) return null;
+    return customers.find(c => c.id === ticket.customerId);
+  }, [ticket, customers]);
 
+  // Carica il ticket singolo
   useEffect(() => {
+    if (!dbUserRef) return;
     setLoading(true);
-    const unsubscribe = onSnapshot(ticketRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const ticketData = { id: docSnap.id, ...docSnap.data() };
-        setTicket(ticketData);
-        setEditData(ticketData); // Inizializza form di modifica
-        
-        // Carica il cliente associato
-        const cust = customers.find(c => c.id === ticketData.customerId);
-        setCustomer(cust || null);
-        
+    const ticketRef = doc(db, `artifacts/${appId}/users/${auth.currentUser.uid}/tickets`, ticketId);
+    
+    const unsubscribe = onSnapshot(ticketRef, (doc) => {
+      if (doc.exists()) {
+        setTicket({ id: doc.id, ...doc.data() });
       } else {
-        console.error("Ticket non trovato!");
-        setTicket(null);
+        console.error("Ticket non trovato");
+        showNotify("Ticket non trovato", "error");
+        onNavigate('Riparazioni');
       }
       setLoading(false);
     }, (error) => {
       console.error("Errore caricamento ticket:", error);
       setLoading(false);
     });
-    
+
     return () => unsubscribe();
-  }, [ticketRef, customers]);
+  }, [dbUserRef, ticketId, onNavigate, showNotify, appId]);
   
-  const handleEditChange = (e) => {
-    const { name, value, type } = e.target;
-    setEditData(prev => ({
-      ...prev,
-      [name]: type === 'number' ? Number(value) : value
-    }));
-  };
-
-  const handleSave = async () => {
+  // Funzione per aggiornare il ticket
+  const updateTicketField = async (field, value) => {
+    if (!dbUserRef) return;
+    const ticketRef = doc(db, `artifacts/${appId}/users/${auth.currentUser.uid}/tickets`, ticketId);
     try {
-      await updateDoc(ticketRef, editData);
-      setIsEditing(false);
-      showNotify("Riparazione aggiornata!", "success");
+      await updateDoc(ticketRef, { [field]: value });
+      showNotify("Ticket aggiornato!", "success");
     } catch (e) {
-      console.error("Errore salvataggio:", e);
-      showNotify("Errore durante il salvataggio.", "error");
-    }
-  };
-  
-  // Funzioni per bottoni rapidi
-  const updateStatus = async (newStatus) => {
-    try {
-      const updates = { status: newStatus };
-      // Se lo stato è "Consegnato", imposta anche il saldo a 0 (prezzo - acconto)
-      if (newStatus === 'Consegnato') {
-        const toPay = (ticket.price || 0) - (ticket.deposit || 0);
-        updates.balance = 0; // Saldo
-        
-        // Aggiungi movimento finanziario (se non già pagato)
-        if (toPay > 0) {
-          const financeCol = collection(dbUserRef, 'finance');
-          await addDoc(financeCol, {
-            date: new Date().toISOString().split('T')[0],
-            description: `Saldo Riparazione ID: ${ticket.shortId}`,
-            amount: toPay,
-            type: 'Entrata',
-            ticketId: ticket.id,
-          });
-        }
-      }
-      await updateDoc(ticketRef, updates);
-      showNotify(`Stato aggiornato a: ${newStatus}`, "success");
-    } catch (e) {
-      console.error("Errore aggiornamento stato:", e);
-      showNotify("Errore aggiornamento stato.", "error");
+      console.error("Errore aggiornamento ticket:", e);
+      showNotify("Errore aggiornamento", "error");
     }
   };
 
-  if (loading) {
+  const handleStatusChange = (e) => {
+    const newStatus = e.target.value;
+    updateTicketField('status', newStatus);
+    
+    // Se completato, aggiungi movimento finanziario
+    if (newStatus === 'Completato' && ticket.price > 0) {
+      const financeRef = collection(dbUserRef, 'finance');
+      addDoc(financeRef, {
+        description: `Riparazione ${ticket.ticketId} - ${ticket.deviceName}`,
+        amount: ticket.price,
+        type: 'Entrata',
+        date: serverTimestamp(),
+        createdBy: appUser.username,
+        ticketId: ticket.id,
+      });
+      showNotify("Movimento finanziario aggiunto!", "info");
+    }
+  };
+  
+  const handlePriceChange = (e) => {
+    const newPrice = parseFloat(e.target.value) || 0;
+    updateTicketField('price', newPrice);
+  };
+  
+  const handleNotesChange = (e) => {
+    updateTicketField('notes', e.target.value);
+  };
+
+  if (loading || !ticket) {
     return (
       <div className="flex justify-center items-center h-full">
-        <div className="loader text-gray-700">Caricamento ticket...</div>
+        <svg className="animate-spin h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
       </div>
     );
   }
 
-  if (!ticket) {
-    return (
-      <div className="p-6">
-        <button onClick={() => onNavigate('Riparazioni')} className="flex items-center text-blue-600 hover:underline mb-4">
-          {ICONS.Back} <span className="ml-2">Torna a Riparazioni</span>
-        </button>
-        <h2 className="text-2xl font-semibold text-red-600">Errore</h2>
-        <p className="text-gray-500">Ticket non trovato.</p>
-      </div>
-    );
-  }
-  
-  const statusOptions = ['In Coda', 'In Lavorazione', 'Pronto per il Ritiro', 'Consegnato', 'Archiviato'];
-  const dataToEdit = isEditing ? editData : ticket;
+  const statusOptions = ['In Coda', 'In Lavorazione', 'Preventivo', 'In Attesa Ricambi', 'Pronto per il Ritiro', 'Completato', 'Non Riparabile'];
 
   return (
     <div className="p-6">
-      {/* Header */}
-      <div className="flex justify-between items-start mb-4">
+      <button onClick={() => onNavigate('Riparazioni')} className="flex items-center text-sm text-blue-400 hover:text-blue-300 mb-4">
+        <ArrowLeft size={16} className="mr-1" />
+        Torna alle Riparazioni
+      </button>
+      
+      {/* Header Dettaglio */}
+      <div className="flex flex-wrap justify-between items-center mb-6">
         <div>
-          <button onClick={() => onNavigate('Riparazioni')} className="flex items-center text-blue-600 hover:underline mb-2">
-            {ICONS.Back} <span className="ml-2">Torna a Riparazioni</span>
-          </button>
-          <h2 className="text-2xl font-semibold text-gray-900">Riparazione ID: {ticket.shortId}</h2>
-          <p className="text-gray-500">{ticket.deviceModel}</p>
+          <h2 className="text-2xl font-semibold text-white">{ticket.deviceName}</h2>
+          <p className="text-gray-400">ID Ticket: {ticket.ticketId}</p>
         </div>
-        <div className="flex flex-col items-end space-y-2">
-          {/* Bottoni Azioni Rapide */}
-          <div className="flex space-x-2">
-            <button onClick={() => setIsPrintModalOpen(true)} className="flex items-center bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2 px-3 rounded-lg text-sm">
-              {ICONS.Print} <span className="ml-1 hidden sm:inline">Stampa</span>
-            </button>
-            <button onClick={() => setIsShareModalOpen(true)} className="flex items-center bg-blue-100 hover:bg-blue-200 text-blue-700 font-medium py-2 px-3 rounded-lg text-sm">
-              {ICONS.Share} <span className="ml-1 hidden sm:inline">Notifica</span>
-            </button>
-            <button onClick={() => setIsPosModalOpen(true)} className="flex items-center bg-green-100 hover:bg-green-200 text-green-700 font-medium py-2 px-3 rounded-lg text-sm">
-              {ICONS.POS} <span className="ml-1 hidden sm:inline">POS</span>
-            </button>
-            
-            {isEditing ? (
-              <button onClick={handleSave} className="flex items-center bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-3 rounded-lg text-sm">
-                Salva
-              </button>
-            ) : (
-              <button onClick={() => setIsEditing(true)} className="flex items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-3 rounded-lg text-sm">
-                {ICONS.Edit} <span className="ml-1 hidden sm:inline">Modifica</span>
-              </button>
-            )}
-          </div>
+        <div className="flex items-center space-x-2 mt-4 sm:mt-0">
+          <button onClick={() => setIsPrintModalOpen(true)} className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"><Printer size={20} /></button>
+          <button onClick={() => setIsShareModalOpen(true)} className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"><Share2 size={20} /></button>
+          <button onClick={() => setIsPosModalOpen(true)} className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"><Receipt size={20} /></button>
         </div>
       </div>
       
-      {/* Contenuto a griglia */}
+      {/* Layout Griglia */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
-        {/* Colonna Sinistra (Dettagli) */}
+        {/* Colonna Principale (Centrale su LG) */}
         <div className="lg:col-span-2 space-y-6">
           
-          {/* Box Cliente */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">{ICONS.Customer} <span className="ml-2">Dati Cliente</span></h3>
+          {/* Info Principali */}
+          <div className="bg-gray-800 rounded-lg shadow p-5">
+            <h3 className="text-lg font-semibold text-white mb-4">Dettagli Riparazione</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-gray-400">Stato</label>
+                <select
+                  value={ticket.status}
+                  onChange={handleStatusChange}
+                  className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  {statusOptions.map(status => (
+                    <option key={status} value={status}>{status}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400">Prezzo Totale</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  defaultValue={ticket.price.toFixed(2)}
+                  onBlur={handlePriceChange} // Aggiorna quando si lascia il campo
+                  className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-400">Dispositivo</label>
+                <p className="text-white">{ticket.deviceName}</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400">Tecnico Assegnato</label>
+                <p className="text-white">{ticket.technician}</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400">IMEI/SN</label>
+                <p className="text-white">{ticket.imei || 'N/D'}</p>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400">Password Dispositivo</label>
+                <p className="text-white">{ticket.password || 'N/D'}</p>
+              </div>
+            </div>
+            
+            <div className="mt-4">
+              <label className="text-xs text-gray-400">Problema Segnalato</label>
+              <p className="text-white p-3 bg-gray-900 rounded-md mt-1">{ticket.problemDescription}</p>
+            </div>
+            
+             <div className="mt-4">
+              <label className="text-xs text-gray-400">Note Interne (visibili solo al tecnico)</label>
+              <textarea
+                defaultValue={ticket.notes}
+                onBlur={handleNotesChange}
+                rows={4}
+                className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="Aggiungi note sulla riparazione..."
+              />
+            </div>
+          </div>
+          
+        </div>
+        
+        {/* Colonna Laterale (Destra su LG) */}
+        <div className="space-y-6">
+          {/* Dettagli Cliente */}
+          <div className="bg-gray-800 rounded-lg shadow p-5">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-semibold text-white">Cliente</h3>
+              <button onClick={() => onNavigate('CustomerEdit', { customerId: customer?.id })} className="text-blue-400 hover:text-blue-300 text-sm">
+                <Edit size={16} />
+              </button>
+            </div>
             {customer ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-                <p><strong>Nome:</strong> {customer.name}</p>
-                <p><strong>Telefono:</strong> {customer.phone}</p>
-                <p><strong>Email:</strong> {customer.email || 'N/D'}</p>
-                <p><strong>Indirizzo:</strong> {customer.address || 'N/D'}</p>
+              <div className="space-y-2">
+                <p className="text-white font-medium">{customer.name}</p>
+                <p className="text-gray-400 text-sm">{customer.phone}</p>
+                <p className="text-gray-400 text-sm">{customer.email}</p>
+                <p className="text-gray-400 text-sm pt-2 border-t border-gray-700 mt-2">{customer.address}</p>
               </div>
             ) : (
               <p className="text-gray-500">Cliente non trovato.</p>
             )}
           </div>
           
-          {/* Box Dispositivo e Problema */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">{ICONS.Device} <span className="ml-2">Dispositivo e Problema</span></h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-              <div>
-                <label className="block text-xs text-gray-500">Modello</label>
-                {isEditing ? (
-                  <input type="text" name="deviceModel" value={editData.deviceModel || ''} onChange={handleEditChange} className="w-full p-2 border rounded" />
-                ) : (
-                  <p>{ticket.deviceModel}</p>
-                )}
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500">IMEI/Seriale</label>
-                {isEditing ? (
-                  <input type="text" name="imei" value={editData.imei || ''} onChange={handleEditChange} className="w-full p-2 border rounded" />
-                ) : (
-                  <p>{ticket.imei || 'N/D'}</p>
-                )}
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500">Password/PIN</label>
-                {isEditing ? (
-                  <input type="text" name="devicePin" value={editData.devicePin || ''} onChange={handleEditChange} className="w-full p-2 border rounded" />
-                ) : (
-                  <p>{ticket.devicePin || 'N/D'}</p>
-                )}
-              </div>
-            </div>
-            <div className="mt-4">
-              <label className="block text-xs text-gray-500">Problema Segnalato</label>
-              {isEditing ? (
-                <textarea name="problem" value={editData.problem || ''} onChange={handleEditChange} className="w-full p-2 border rounded" rows="3"></textarea>
-              ) : (
-                <p className="p-2 bg-gray-50 rounded min-h-[50px]">{ticket.problem || 'Nessuno'}</p>
-              )}
-            </div>
+          {/* Altre Azioni */}
+          <div className="bg-gray-800 rounded-lg shadow p-5">
+            <h3 className="text-lg font-semibold text-white mb-4">Azioni Rapide</h3>
+            <button
+              onClick={async () => {
+                if(window.confirm("Sei sicuro di voler eliminare questo ticket? L'azione è irreversibile.")) {
+                  try {
+                    const ticketRef = doc(db, `artifacts/${appId}/users/${auth.currentUser.uid}/tickets`, ticketId);
+                    await deleteDoc(ticketRef);
+                    showNotify("Ticket eliminato!", "success");
+                    onNavigate('Riparazioni');
+                  } catch (e) {
+                    showNotify("Errore eliminazione", "error");
+                  }
+                }
+              }}
+              className="w-full flex items-center justify-center p-3 rounded-lg bg-red-600 hover:bg-red-700 text-white font-medium"
+            >
+              <Trash2 size={16} className="mr-2" />
+              Elimina Riparazione
+            </button>
           </div>
           
-          {/* Box Note Interne */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">{ICONS.Notes} <span className="ml-2">Note Interne (Solo Staff)</span></h3>
-            {isEditing ? (
-              <textarea name="internalNotes" value={editData.internalNotes || ''} onChange={handleEditChange} className="w-full p-2 border rounded" rows="5"></textarea>
-            ) : (
-              <p className="p-2 bg-yellow-50 text-yellow-800 rounded min-h-[100px]">{ticket.internalNotes || 'Nessuna nota interna.'}</p>
-            )}
-          </div>
-        </div>
-        
-        {/* Colonna Destra (Stato e Finanze) */}
-        <div className="lg:col-span-1 space-y-6">
-          
-          {/* Box Stato */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">{ICONS.Info} <span className="ml-2">Stato Riparazione</span></h3>
-            
-            <label className="block text-xs text-gray-500">Stato Attuale</label>
-            {isEditing ? (
-              <select name="status" value={editData.status} onChange={handleEditChange} className="w-full p-2 border rounded bg-white">
-                {statusOptions.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-            ) : (
-              <p className="text-lg font-bold">{ticket.status}</p>
-            )}
-            
-            <div className="mt-4">
-              <label className="block text-xs text-gray-500">Tecnico Assegnato</label>
-              {isEditing ? (
-                <select name="assignedTo" value={editData.assignedTo} onChange={handleEditChange} className="w-full p-2 border rounded bg-white">
-                  <option value="">Non assegnato</option>
-                  {technicians.map(t => <option key={t.id} value={t.id}>{t.username}</option>)}
-                </select>
-              ) : (
-                <p>{technicians.find(t => t.id === ticket.assignedTo)?.username || 'Non assegnato'}</p>
-              )}
-            </div>
-            
-            <div className="mt-4">
-              <label className="block text-xs text-gray-500">Data Arrivo</label>
-              <p>{new Date(ticket.arrivalDate).toLocaleString()}</p>
-            </div>
-            
-            {/* Bottoni Cambio Stato Rapido */}
-            {!isEditing && (
-              <div className="mt-6 space-y-2">
-                {ticket.status === 'In Coda' && (
-                  <button onClick={() => updateStatus('In Lavorazione')} className="w-full text-center p-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600">
-                    Prendi in Carico
-                  </button>
-                )}
-                {ticket.status === 'In Lavorazione' && (
-                  <button onClick={() => updateStatus('Pronto per il Ritiro')} className="w-full text-center p-2 rounded-lg bg-green-500 text-white hover:bg-green-600">
-                    Completa Riparazione
-                  </button>
-                )}
-                {ticket.status === 'Pronto per il Ritiro' && (
-                  <button onClick={() => updateStatus('Consegnato')} className="w-full text-center p-2 rounded-lg bg-gray-700 text-white hover:bg-gray-800">
-                    Consegna al Cliente
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-          
-          {/* Box Finanze */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">{ICONS.Deposit} <span className="ml-2">Finanze</span></h3>
-            
-            <div className="mb-4">
-              <label className="block text-xs text-gray-500">Preventivo (€)</label>
-              {isEditing ? (
-                <input type="number" name="price" value={editData.price || 0} onChange={handleEditChange} className="w-full p-2 border rounded" />
-              ) : (
-                <p className="text-2xl font-bold">€{ticket.price || 0}</p>
-              )}
-            </div>
-            
-            <div className="mb-4">
-              <label className="block text-xs text-gray-500">Acconto Versato (€)</label>
-              {isEditing ? (
-                <input type="number" name="deposit" value={editData.deposit || 0} onChange={handleEditChange} className="w-full p-2 border rounded" />
-              ) : (
-                <p className="text-lg">€{ticket.deposit || 0}</p>
-              )}
-            </div>
-            
-            <hr className="my-4" />
-            
-            <div className="text-right">
-              <p className="text-sm text-gray-500">Saldo da Pagare</p>
-              <p className="text-3xl font-bold text-green-600">
-                €{( (isEditing ? editData.price : ticket.price) || 0) - ( (isEditing ? editData.deposit : ticket.deposit) || 0)}
-              </p>
-            </div>
-          </div>
-
         </div>
       </div>
       
       {/* Modali */}
-      <PrintModal
-        isOpen={isPrintModalOpen}
-        onClose={() => setIsPrintModalOpen(false)}
+      <PrintModal 
+        isOpen={isPrintModalOpen} 
+        onClose={() => setIsPrintModalOpen(false)} 
         ticket={ticket}
         customer={customer}
         appUser={appUser}
       />
-      <ShareModal
-        isOpen={isShareModalOpen}
+      <ShareModal 
+        isOpen={isShareModalOpen} 
         onClose={() => setIsShareModalOpen(false)}
         ticket={ticket}
         customer={customer}
@@ -1564,96 +1464,76 @@ const RepairDetailView = ({ ticketId, onNavigate, dbUserRef, appUser, customers,
 
 // --- SEZIONE CLIENTI ---
 const CustomerView = ({ dbUserRef, onNavigate, customers, loadingCustomers }) => {
-  const [view, setView] = useState('list'); // 'list' o 'new' o 'edit'
-  const [currentCustomer, setCurrentCustomer] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
-
-  const handleSaveCustomer = async (customerData) => {
-    try {
-      if (view === 'new') {
-        const customersCol = collection(dbUserRef, 'customers');
-        await addDoc(customersCol, customerData);
-      } else if (view === 'edit' && currentCustomer) {
-        const customerRef = doc(dbUserRef, 'customers', currentCustomer.id);
-        await updateDoc(customerRef, customerData);
-      }
-      setView('list');
-      setCurrentCustomer(null);
-    } catch (e) {
-      console.error("Errore salvataggio cliente:", e);
-    }
-  };
 
   const filteredCustomers = customers.filter(c => 
     c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    c.phone.toLowerCase().includes(searchTerm.toLowerCase())
+    c.phone.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    c.email.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  if (view === 'new' || (view === 'edit' && currentCustomer)) {
-    return (
-      <CustomerForm
-        customer={currentCustomer}
-        onSave={handleSaveCustomer}
-        onCancel={() => { setView('list'); setCurrentCustomer(null); }}
-      />
+  if (loadingCustomers) {
+     return (
+      <div className="flex justify-center items-center h-full">
+        <svg className="animate-spin h-8 w-8 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+      </div>
     );
   }
 
   return (
     <div className="p-6">
-      <div className="flex justify-between items-center mb-4">
-        <h2 className="text-2xl font-semibold text-gray-900">Clienti</h2>
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-semibold text-white">Clienti</h2>
         <button
-          onClick={() => setView('new')}
-          className="flex items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"
+          onClick={() => onNavigate('CustomerEdit', { customerId: null })}
+          className="flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
         >
-          {ICONS.NewCustomer}
-          <span className="ml-2">Nuovo Cliente</span>
+          <UserPlus size={16} className="mr-2" />
+          Nuovo Cliente
         </button>
       </div>
       
       <input
         type="text"
-        placeholder="Cerca per nome o telefono..."
-        className="w-full p-2 border rounded-md mb-4"
+        placeholder="Cerca cliente per nome, telefono, email..."
+        className="w-full bg-gray-700 text-white placeholder-gray-400 px-4 py-2 rounded-lg mb-6 focus:outline-none focus:ring-2 focus:ring-blue-500"
         onChange={(e) => setSearchTerm(e.target.value)}
       />
-      
-      <div className="bg-white shadow-md rounded-lg overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
+
+      <div className="bg-gray-800 rounded-lg shadow overflow-hidden">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead className="bg-gray-700/50">
             <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Nome</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Telefono</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Email</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Azioni</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Nome</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Telefono</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Email</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Azioni</th>
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
-            {loadingCustomers ? (
-              <tr><td colSpan="4" className="text-center p-4">Caricamento...</td></tr>
-            ) : (
-              filteredCustomers.map(customer => (
-                <tr key={customer.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 text-sm font-medium text-gray-900">{customer.name}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{customer.phone}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{customer.email || 'N/D'}</td>
-                  <td className="px-6 py-4 text-sm">
-                    <button
-                      onClick={() => {
-                        setCurrentCustomer(customer);
-                        setView('edit');
-                      }}
-                      className="text-blue-600 hover:text-blue-800"
-                    >
-                      Modifica
-                    </button>
-                  </td>
-                </tr>
-              ))
-            )}
+          <tbody className="bg-gray-800 divide-y divide-gray-700">
+            {filteredCustomers.map(customer => (
+              <tr key={customer.id}>
+                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-white">{customer.name}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{customer.phone}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{customer.email}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                  <button
+                    onClick={() => onNavigate('CustomerEdit', { customerId: customer.id })}
+                    className="text-blue-400 hover:text-blue-300"
+                  >
+                    <Edit size={16} />
+                  </button>
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
+         {filteredCustomers.length === 0 && (
+           <p className="text-center text-gray-500 py-10">Nessun cliente trovato.</p>
+        )}
       </div>
     </div>
   );
@@ -1662,63 +1542,64 @@ const CustomerView = ({ dbUserRef, onNavigate, customers, loadingCustomers }) =>
 // Form Cliente
 const CustomerForm = ({ customer, onSave, onCancel }) => {
   const [formData, setFormData] = useState({
-    name: '',
-    phone: '',
-    email: '',
-    address: '',
+    name: customer?.name || '',
+    phone: customer?.phone || '',
+    email: customer?.email || '',
+    address: customer?.address || '',
+    piva: customer?.piva || '',
+    cf: customer?.cf || '',
   });
 
-  useEffect(() => {
-    if (customer) {
-      setFormData(customer);
-    } else {
-      setFormData({ name: '', phone: '', email: '', address: '' });
-    }
-  }, [customer]);
-
   const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
+    setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
   };
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (formData.name && formData.phone) {
-      onSave(formData);
-    } else {
-      alert("Nome e Telefono sono obbligatori.");
-    }
+    onSave(formData);
   };
 
   return (
     <div className="p-6">
-      <h2 className="text-2xl font-semibold text-gray-900 mb-6">
+      <button onClick={onCancel} className="flex items-center text-sm text-blue-400 hover:text-blue-300 mb-4">
+        <ArrowLeft size={16} className="mr-1" />
+        Torna ai Clienti
+      </button>
+      <h2 className="text-2xl font-semibold text-white mb-6">
         {customer ? 'Modifica Cliente' : 'Nuovo Cliente'}
       </h2>
-      <form onSubmit={handleSubmit} className="max-w-lg mx-auto bg-white p-8 rounded-lg shadow-md">
+      <form onSubmit={handleSubmit} className="bg-gray-800 rounded-lg shadow p-6 space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="md:col-span-2">
-            <label className="block text-gray-700">Nome Completo *</label>
-            <input type="text" name="name" value={formData.name} onChange={handleChange} className="w-full p-2 border rounded" required />
+          <div>
+            <label htmlFor="name" className="block text-sm font-medium text-gray-300">Nome Completo / Ragione Sociale *</label>
+            <input type="text" name="name" id="name" value={formData.name} onChange={handleChange} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
           <div>
-            <label className="block text-gray-700">Telefono *</label>
-            <input type="tel" name="phone" value={formData.phone} onChange={handleChange} className="w-full p-2 border rounded" required />
+            <label htmlFor="phone" className="block text-sm font-medium text-gray-300">Telefono *</label>
+            <input type="tel" name="phone" id="phone" value={formData.phone} onChange={handleChange} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
           <div>
-            <label className="block text-gray-700">Email</label>
-            <input type="email" name="email" value={formData.email} onChange={handleChange} className="w-full p-2 border rounded" />
+            <label htmlFor="email" className="block text-sm font-medium text-gray-300">Email</label>
+            <input type="email" name="email" id="email" value={formData.email} onChange={handleChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
-          <div className="md:col-span-2">
-            <label className="block text-gray-700">Indirizzo</label>
-            <input type="text" name="address" value={formData.address} onChange={handleChange} className="w-full p-2 border rounded" />
+           <div>
+            <label htmlFor="address" className="block text-sm font-medium text-gray-300">Indirizzo</label>
+            <input type="text" name="address" id="address" value={formData.address} onChange={handleChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label htmlFor="piva" className="block text-sm font-medium text-gray-300">P.IVA</label>
+            <input type="text" name="piva" id="piva" value={formData.piva} onChange={handleChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label htmlFor="cf" className="block text-sm font-medium text-gray-300">Codice Fiscale</label>
+            <input type="text" name="cf" id="cf" value={formData.cf} onChange={handleChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
         </div>
-        <div className="flex justify-end gap-4 mt-6">
-          <button type="button" onClick={onCancel} className="py-2 px-4 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">
+        <div className="flex justify-end space-x-4">
+          <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg bg-gray-600 text-white hover:bg-gray-500">
             Annulla
           </button>
-          <button type="submit" className="py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+          <button type="submit" className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700">
             Salva Cliente
           </button>
         </div>
@@ -1731,25 +1612,40 @@ const CustomerForm = ({ customer, onSave, onCancel }) => {
 // --- SEZIONE FINANZE ---
 const FinanceView = ({ dbUserRef, appUser, managedUsers }) => {
   const { movements, loading } = useFinance(dbUserRef, appUser, managedUsers);
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [formData, setFormData] = useState({ date: new Date().toISOString().split('T')[0], description: '', amount: 0, type: 'Uscita' });
-  
-  const handleSaveMovement = async () => {
-    if (!formData.description || !formData.amount) {
-      alert("Descrizione e Importo sono obbligatori.");
+  const [description, setDescription] = useState('');
+  const [amount, setAmount] = useState(0);
+  const [type, setType] = useState('Entrata');
+
+  const handleAddMovement = async (e) => {
+    e.preventDefault();
+    if (!dbUserRef || !description || amount <= 0) {
+      alert("Compila tutti i campi.");
       return;
     }
+    
     try {
-      const financeCol = collection(dbUserRef, 'finance');
-      await addDoc(financeCol, {
-        ...formData,
-        amount: Number(formData.amount),
-        createdBy: appUser.id
+      await addDoc(collection(dbUserRef, 'finance'), {
+        description,
+        amount: parseFloat(amount),
+        type,
+        date: serverTimestamp(),
+        createdBy: appUser.username
       });
-      setIsModalOpen(false);
-      setFormData({ date: new Date().toISOString().split('T')[0], description: '', amount: 0, type: 'Uscita' });
+      // Reset form
+      setDescription('');
+      setAmount(0);
+      setType('Entrata');
     } catch (e) {
-      console.error("Errore salvataggio movimento:", e);
+      console.error("Errore aggiunta movimento:", e);
+    }
+  };
+
+  const deleteMovement = async (id) => {
+    if (!dbUserRef || !window.confirm("Sei sicuro di voler eliminare questo movimento?")) return;
+    try {
+      await deleteDoc(doc(dbUserRef, 'finance', id));
+    } catch (e) {
+      console.error("Errore eliminazione movimento:", e);
     }
   };
 
@@ -1759,98 +1655,78 @@ const FinanceView = ({ dbUserRef, appUser, managedUsers }) => {
 
   return (
     <div className="p-6">
-      <div className="flex justify-between items-center mb-4">
-        <h2 className="text-2xl font-semibold text-gray-900">Finanze</h2>
-        <button
-          onClick={() => setIsModalOpen(true)}
-          className="flex items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"
-        >
-          {ICONS.NewMovement}
-          <span className="ml-2">Nuovo Movimento</span>
-        </button>
-      </div>
+      <h2 className="text-2xl font-semibold text-white mb-6">Gestione Finanze</h2>
       
-      {/* Riepilogo Finanziario */}
+      {/* Riepilogo */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        <div className="p-4 bg-green-100 rounded-lg shadow">
-          <p className="text-sm text-green-700">Entrate Totali</p>
-          <p className="text-2xl font-bold text-green-800">€{totalEntrate.toFixed(2)}</p>
+        <div className="bg-green-800/50 p-4 rounded-lg">
+          <p className="text-sm text-green-300">Entrate Totali</p>
+          <p className="text-2xl font-bold text-white">€{totalEntrate.toFixed(2)}</p>
         </div>
-        <div className="p-4 bg-red-100 rounded-lg shadow">
-          <p className="text-sm text-red-700">Uscite Totali</p>
-          <p className="text-2xl font-bold text-red-800">€{totalUscite.toFixed(2)}</p>
+        <div className="bg-red-800/50 p-4 rounded-lg">
+          <p className="text-sm text-red-300">Uscite Totali</p>
+          <p className="text-2xl font-bold text-white">€{totalUscite.toFixed(2)}</p>
         </div>
-        <div className="p-4 bg-blue-100 rounded-lg shadow">
-          <p className="text-sm text-blue-700">Saldo Attuale</p>
-          <p className="text-2xl font-bold text-blue-800">€{balance.toFixed(2)}</p>
+        <div className="bg-gray-700 p-4 rounded-lg">
+          <p className="text-sm text-gray-300">Saldo</p>
+          <p className={`text-2xl font-bold ${balance >= 0 ? 'text-white' : 'text-red-400'}`}>€{balance.toFixed(2)}</p>
         </div>
       </div>
       
-      {/* Tabella Movimenti */}
-      <div className="bg-white shadow-md rounded-lg overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
+      {/* Aggiungi Movimento */}
+      <form onSubmit={handleAddMovement} className="bg-gray-800 rounded-lg shadow p-5 mb-6 flex flex-wrap gap-4 items-end">
+        <div className="flex-grow">
+          <label htmlFor="desc" className="block text-sm font-medium text-gray-300">Descrizione</label>
+          <input type="text" id="desc" value={description} onChange={e => setDescription(e.target.value)} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div className="w-full sm:w-auto">
+          <label htmlFor="amount" className="block text-sm font-medium text-gray-300">Importo</label>
+          <input type="number" step="0.01" id="amount" value={amount} onChange={e => setAmount(e.target.value)} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div className="w-full sm:w-auto">
+          <label htmlFor="type" className="block text-sm font-medium text-gray-300">Tipo</label>
+          <select id="type" value={type} onChange={e => setType(e.target.value)} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="Entrata">Entrata</option>
+            <option value="Uscita">Uscita</option>
+          </select>
+        </div>
+        <button type="submit" className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Aggiungi</button>
+      </form>
+
+      {/* Lista Movimenti */}
+      <div className="bg-gray-800 rounded-lg shadow overflow-hidden">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead className="bg-gray-700/50">
             <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Data</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Descrizione</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Importo</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Data</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Descrizione</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Importo</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Azioni</th>
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
+          <tbody className="bg-gray-800 divide-y divide-gray-700">
             {loading ? (
-              <tr><td colSpan="3" className="text-center p-4">Caricamento...</td></tr>
-            ) : (
-              movements.map(mov => (
-                <tr key={mov.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 text-sm text-gray-700">{new Date(mov.date).toLocaleDateString()}</td>
-                  <td className="px-6 py-4 text-sm text-gray-900">{mov.description}</td>
-                  <td className={`px-6 py-4 text-sm font-bold ${mov.type === 'Entrata' ? 'text-green-600' : 'text-red-600'}`}>
-                    {mov.type === 'Entrata' ? '+' : '-'}€{mov.amount.toFixed(2)}
-                  </td>
-                </tr>
-              ))
-            )}
+              <tr><td colSpan="4" className="text-center p-5 text-gray-500">Caricamento...</td></tr>
+            ) : movements.map(m => (
+              <tr key={m.id}>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{m.date.toLocaleDateString()}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{m.description}</td>
+                <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${m.type === 'Entrata' ? 'text-green-400' : 'text-red-400'}`}>
+                  {m.type === 'Entrata' ? '+' : '-'}€{m.amount.toFixed(2)}
+                </td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                  <button onClick={() => deleteMovement(m.id)} className="text-red-400 hover:text-red-300">
+                    <Trash2 size={16} />
+                  </button>
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
+         {!loading && movements.length === 0 && (
+           <p className="text-center text-gray-500 py-10">Nessun movimento registrato.</p>
+        )}
       </div>
-      
-      {/* Modal Nuovo Movimento */}
-      {isModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 z-40 flex justify-center items-center p-4">
-          <div className="bg-white p-6 rounded-lg shadow-xl w-full max-w-md">
-            <h3 className="text-lg font-semibold mb-4">Nuovo Movimento</h3>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm">Data</label>
-                <input type="date" value={formData.date} onChange={(e) => setFormData(f => ({...f, date: e.target.value}))} className="w-full p-2 border rounded" />
-              </div>
-              <div>
-                <label className="block text-sm">Descrizione</label>
-                <input type="text" value={formData.description} onChange={(e) => setFormData(f => ({...f, description: e.target.value}))} className="w-full p-2 border rounded" />
-              </div>
-              <div>
-                <label className="block text-sm">Importo (€)</label>
-                <input type="number" value={formData.amount} onChange={(e) => setFormData(f => ({...f, amount: e.target.value}))} className="w-full p-2 border rounded" />
-              </div>
-              <div>
-                <label className="block text-sm">Tipo</label>
-                <select value={formData.type} onChange={(e) => setFormData(f => ({...f, type: e.target.value}))} className="w-full p-2 border rounded bg-white">
-                  <option value="Uscita">Uscita</option>
-                  <option value="Entrata">Entrata</option>
-                </select>
-              </div>
-            </div>
-            <div className="flex justify-end gap-4 mt-6">
-              <button onClick={() => setIsModalOpen(false)} className="py-2 px-4 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">
-                Annulla
-              </button>
-              <button onClick={handleSaveMovement} className="py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-                Salva
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };
@@ -1858,18 +1734,19 @@ const FinanceView = ({ dbUserRef, appUser, managedUsers }) => {
 
 // --- SEZIONE IMPOSTAZIONI (ADMIN) ---
 const SettingsView = ({ dbUserRef, appUser }) => {
-  // Hook per caricare TUTTI gli utenti (Admin e Tecnici)
-  const [managedUsers, setManagedUsers] = useState([]);
+  const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('list'); // 'list', 'new', 'edit'
-  const [currentUser, setCurrentUser] = useState(null);
+  const [editingUser, setEditingUser] = useState(null); // null per nuovo, altrimenti ID utente
 
   useEffect(() => {
-    if (appUser.role !== 'Owner') return; // Solo Owner
+    if (appUser?.role !== 'Owner' || !dbUserRef) {
+      setLoading(false);
+      return;
+    }
     
-    const usersCol = collection(dbUserRef, 'managedUsers');
-    const unsubscribe = onSnapshot(usersCol, (snapshot) => {
-      setManagedUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    const usersRef = collection(dbUserRef, 'users');
+    const unsubscribe = onSnapshot(usersRef, (snapshot) => {
+      setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
       setLoading(false);
     }, (error) => {
       console.error("Errore caricamento utenti:", error);
@@ -1877,119 +1754,91 @@ const SettingsView = ({ dbUserRef, appUser }) => {
     });
     
     return () => unsubscribe();
-  }, [dbUserRef, appUser.role]);
-  
+  }, [dbUserRef, appUser]);
+
   const handleSaveUser = async (userData) => {
+    if (!dbUserRef) return;
+    const usersRef = collection(dbUserRef, 'users');
+    
     try {
-      if (view === 'new') {
-        // ID univoco per il nuovo utente (es. username in minuscolo)
-        const newId = userData.username.toLowerCase().replace(/\s/g, '');
-        if (!newId) {
-          alert("Username non valido.");
-          return;
-        }
-        // Controlla se esiste già
-        const userRef = doc(dbUserRef, 'managedUsers', newId);
-        const docSnap = await getDoc(userRef);
-        if (docSnap.exists()) {
-          alert("Questo username esiste già.");
-          return;
-        }
-        await setDoc(userRef, { ...userData, id: newId });
-        
-      } else if (view === 'edit' && currentUser) {
-        // Non permettiamo di cambiare l'ID (username) per ora
-        const userRef = doc(dbUserRef, 'managedUsers', currentUser.id);
-        await updateDoc(userRef, userData);
+      if (editingUser) {
+        // Modifica utente esistente
+        await setDoc(doc(usersRef, editingUser.id), userData);
+      } else {
+        // Crea nuovo utente (usa username come ID)
+        await setDoc(doc(usersRef, userData.username), userData);
       }
-      setView('list');
-      setCurrentUser(null);
+      setEditingUser(null);
     } catch (e) {
       console.error("Errore salvataggio utente:", e);
     }
   };
   
-  const handleDeleteUser = async (userId) => {
-    if (userId === 'owner') {
-      alert("Impossibile eliminare l'utente Owner.");
+  const handleDeleteUser = async (userId, username) => {
+    if (username === 'owner') {
+      alert("Non puoi eliminare l'utente 'owner' principale.");
       return;
     }
-    if (window.confirm("Sei sicuro di voler eliminare questo utente?")) {
-      try {
-        const userRef = doc(dbUserRef, 'managedUsers', userId);
-        await deleteDoc(userRef);
-      } catch (e) {
-        console.error("Errore eliminazione utente:", e);
-      }
+    if (!dbUserRef || !window.confirm(`Sei sicuro di voler eliminare l'utente ${username}?`)) return;
+    
+    try {
+      await deleteDoc(doc(dbUserRef, 'users', userId));
+    } catch (e) {
+      console.error("Errore eliminazione utente:", e);
     }
   };
 
-  if (appUser.role !== 'Owner') {
-    return <div className="p-6 text-red-500">Accesso negato. Solo l'Owner può accedere alle impostazioni.</div>;
+  if (appUser?.role !== 'Owner') {
+    return <div className="p-6 text-red-400">Accesso non autorizzato.</div>;
   }
   
-  if (view === 'new' || (view === 'edit' && currentUser)) {
+  if (editingUser || editingUser === null) {
     return (
       <UserForm
-        user={currentUser}
+        user={editingUser}
         onSave={handleSaveUser}
-        onCancel={() => { setView('list'); setCurrentUser(null); }}
+        onCancel={() => setEditingUser(undefined)} // 'undefined' per distinguere da 'null' (nuovo)
       />
     );
   }
 
   return (
     <div className="p-6">
-      <div className="flex justify-between items-center mb-4">
-        <h2 className="text-2xl font-semibold text-gray-900">Impostazioni Utenti</h2>
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-semibold text-white">Gestione Utenti</h2>
         <button
-          onClick={() => { setView('new'); setCurrentUser(null); }}
-          className="flex items-center bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"
+          onClick={() => setEditingUser(null)} // 'null' per nuovo utente
+          className="flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
         >
-          {ICONS.NewCustomer}
-          <span className="ml-2">Nuovo Utente</span>
+          <UserPlus size={16} className="mr-2" />
+          Nuovo Utente
         </button>
       </div>
-      
-      <div className="bg-white shadow-md rounded-lg overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
+
+      <div className="bg-gray-800 rounded-lg shadow overflow-hidden">
+        <table className="min-w-full divide-y divide-gray-700">
+          <thead className="bg-gray-700/50">
             <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Username</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Ruolo</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Azioni</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Username</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Ruolo</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">PIN</th>
+              <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Azioni</th>
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
+          <tbody className="bg-gray-800 divide-y divide-gray-700">
             {loading ? (
-              <tr><td colSpan="3" className="text-center p-4">Caricamento...</td></tr>
-            ) : (
-              managedUsers.map(user => (
-                <tr key={user.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 text-sm font-medium text-gray-900">{user.username}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{user.role}</td>
-                  <td className="px-6 py-4 text-sm space-x-2">
-                    <button
-                      onClick={() => {
-                        setCurrentUser(user);
-                        setView('edit');
-                      }}
-                      className="text-blue-600 hover:text-blue-800"
-                    >
-                      Modifica
-                    </button>
-                    {user.id !== 'owner' && (
-                      <button
-                        onClick={() => handleDeleteUser(user.id)}
-                        className="text-red-600 hover:text-red-800"
-                      >
-                        Elimina
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))
-            )}
+              <tr><td colSpan="4" className="text-center p-5 text-gray-500">Caricamento...</td></tr>
+            ) : users.map(user => (
+              <tr key={user.id}>
+                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-white">{user.username}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{user.role}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{user.pin}</td>
+                <td className="px-6 py-4 whitespace-nowrap text-sm space-x-4">
+                  <button onClick={() => setEditingUser(user)} className="text-blue-400 hover:text-blue-300"><Edit size={16} /></button>
+                  <button onClick={() => handleDeleteUser(user.id, user.username)} className="text-red-400 hover:text-red-300"><Trash2 size={16} /></button>
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -2000,94 +1849,57 @@ const SettingsView = ({ dbUserRef, appUser }) => {
 // Form Utente
 const UserForm = ({ user, onSave, onCancel }) => {
   const [formData, setFormData] = useState({
-    username: '',
-    password: '',
-    role: 'Technician',
-    permissions: [],
+    username: user?.username || '',
+    password: user?.password || '',
+    role: user?.role || 'Tecnico',
+    pin: user?.pin || '',
   });
   
-  const isNew = !user;
-
-  useEffect(() => {
-    if (user) {
-      setFormData(user);
-    } else {
-      setFormData({ username: '', password: '', role: 'Technician', permissions: [] });
-    }
-  }, [user]);
+  const isEditing = !!user;
 
   const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
+    setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
   };
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (formData.username && formData.password) {
-      // Semplice gestione permessi (da migliorare)
-      let permissions = [];
-      if (formData.role === 'Owner') permissions = ['all'];
-      if (formData.role === 'Admin') permissions = ['all']; // Admin = Owner (quasi)
-      if (formData.role === 'Technician') permissions = ['view_repairs', 'edit_repairs'];
-      
-      onSave({ ...formData, permissions });
-    } else {
-      alert("Username e Password sono obbligatori.");
-    }
+    onSave(formData);
   };
 
   return (
     <div className="p-6">
-      <h2 className="text-2xl font-semibold text-gray-900 mb-6">
-        {user ? 'Modifica Utente' : 'Nuovo Utente'}
+      <button onClick={onCancel} className="flex items-center text-sm text-blue-400 hover:text-blue-300 mb-4">
+        <ArrowLeft size={16} className="mr-1" />
+        Torna agli Utenti
+      </button>
+      <h2 className="text-2xl font-semibold text-white mb-6">
+        {isEditing ? 'Modifica Utente' : 'Nuovo Utente'}
       </h2>
-      <form onSubmit={handleSubmit} className="max-w-lg mx-auto bg-white p-8 rounded-lg shadow-md">
-        <div className="space-y-4">
-          <div>
-            <label className="block text-gray-700">Username *</label>
-            <input 
-              type="text" 
-              name="username" 
-              value={formData.username} 
-              onChange={handleChange} 
-              className="w-full p-2 border rounded" 
-              required 
-              disabled={!isNew} // Non si può cambiare username
-            />
-            {!isNew && <p className="text-xs text-gray-400">L'username non può essere modificato.</p>}
-          </div>
-          <div>
-            <label className="block text-gray-700">Password *</label>
-            <input 
-              type="password" 
-              name="password" 
-              value={formData.password} 
-              onChange={handleChange} 
-              className="w-full p-2 border rounded" 
-              required 
-              placeholder={isNew ? "" : "Lascia vuoto per non cambiare"}
-            />
-          </div>
-          <div>
-            <label className="block text-gray-700">Ruolo</label>
-            <select 
-              name="role" 
-              value={formData.role} 
-              onChange={handleChange} 
-              className="w-full p-2 border rounded bg-white"
-              disabled={formData.id === 'owner'} // Non si può cambiare ruolo a Owner
-            >
-              <option value="Technician">Tecnico</option>
-              <option value="Admin">Admin</option>
-              <option value="Owner">Owner</option>
-            </select>
-          </div>
+      <form onSubmit={handleSubmit} className="bg-gray-800 rounded-lg shadow p-6 max-w-lg mx-auto space-y-4">
+        <div>
+          <label htmlFor="username" className="block text-sm font-medium text-gray-300">Username *</label>
+          <input type="text" name="username" id="username" value={formData.username} onChange={handleChange} required disabled={isEditing} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50" />
         </div>
-        <div className="flex justify-end gap-4 mt-6">
-          <button type="button" onClick={onCancel} className="py-2 px-4 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">
+        <div>
+          <label htmlFor="password" className="block text-sm font-medium text-gray-300">Password *</label>
+          <input type="password" name="password" id="password" value={formData.password} onChange={handleChange} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div>
+          <label htmlFor="role" className="block text-sm font-medium text-gray-300">Ruolo *</label>
+          <select name="role" id="role" value={formData.role} onChange={handleChange} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="Tecnico">Tecnico</option>
+            <option value="Owner">Owner</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="pin" className="block text-sm font-medium text-gray-300">PIN (per sblocco rapido)</label>
+          <input type="text" name="pin" id="pin" value={formData.pin} onChange={handleChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+        </div>
+        <div className="flex justify-end space-x-4">
+          <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg bg-gray-600 text-white hover:bg-gray-500">
             Annulla
           </button>
-          <button type="submit" className="py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+          <button type="submit" className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700">
             Salva Utente
           </button>
         </div>
@@ -2099,254 +1911,225 @@ const UserForm = ({ user, onSave, onCancel }) => {
 
 // --- SEZIONE NUOVA RIPARAZIONE ---
 const NewRepairForm = ({ dbUserRef, appUser, onNavigate, customers, loadingCustomers, technicians, showNotify }) => {
-  const [step, setStep] = useState(1); // 1: Cliente, 2: Dispositivo, 3: Riepilogo
-  const [selectedCustomerId, setSelectedCustomerId] = useState(null);
-  const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', email: '', address: '' });
-  const [deviceData, setDeviceData] = useState({
-    deviceModel: '',
+  const [step, setStep] = useState(1); // 1: Cliente, 2: Dispositivo
+  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  
+  // Dati Cliente (per step 1, se nuovo)
+  const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', email: '' });
+  
+  // Dati Riparazione (per step 2)
+  const [repairData, setRepairData] = useState({
+    deviceName: '',
     imei: '',
-    devicePin: '',
-    problem: '',
-    internalNotes: '',
+    password: '',
+    problemDescription: '',
+    technician: appUser?.username || '',
     price: 0,
-    deposit: 0,
-    assignedTo: '',
-    status: 'In Coda',
-    arrivalDate: new Date().toISOString(),
+    status: 'In Coda'
   });
-  
-  const handleDeviceChange = (e) => {
-    const { name, value, type } = e.target;
-    setDeviceData(prev => ({
-      ...prev,
-      [name]: type === 'number' ? Number(value) : value
-    }));
+
+  const handleCustomerChange = (e) => {
+    setNewCustomer(prev => ({ ...prev, [e.target.name]: e.target.value }));
   };
   
-  const handleNewCustomerChange = (e) => {
-    const { name, value } = e.target;
-    setNewCustomer(prev => ({ ...prev, [name]: value }));
+  const handleRepairChange = (e) => {
+    setRepairData(prev => ({ ...prev, [e.target.name]: e.target.value }));
   };
 
-  const handleCreateTicket = async () => {
-    let customerId = selectedCustomerId;
+  const filteredCustomers = customers.filter(c => 
+    c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    c.phone.toLowerCase().includes(searchTerm.toLowerCase())
+  ).slice(0, 10); // Limita a 10 risultati
+
+  const selectCustomer = (customer) => {
+    setSelectedCustomer(customer);
+    setSearchTerm(customer.name);
+  };
+
+  const goToStep2 = async () => {
+    let customerId = selectedCustomer?.id;
     
-    try {
-      // 1. Se è un nuovo cliente, crealo prima
-      if (!customerId) {
-        if (!newCustomer.name || !newCustomer.phone) {
-          showNotify("Nome e Telefono del nuovo cliente sono obbligatori.", "error");
-          return;
-        }
-        const customersCol = collection(dbUserRef, 'customers');
-        const docRef = await addDoc(customersCol, newCustomer);
+    // Se non c'è un cliente selezionato, prova a creare quello nuovo
+    if (!selectedCustomer) {
+      if (!newCustomer.name || !newCustomer.phone) {
+        showNotify("Nome e Telefono sono obbligatori per un nuovo cliente.", "error");
+        return;
+      }
+      // Crea nuovo cliente
+      try {
+        const docRef = await addDoc(collection(dbUserRef, 'customers'), {
+          ...newCustomer,
+          createdAt: serverTimestamp()
+        });
         customerId = docRef.id;
+      } catch (e) {
+        console.error("Errore creazione cliente:", e);
+        showNotify("Errore creazione cliente.", "error");
+        return;
       }
-      
-      // 2. Genera un ID corto
-      const counterRef = doc(dbUserRef, 'state', 'ticketCounter');
-      let nextId = 1001;
-      const counterSnap = await getDoc(counterRef);
-      
-      if (counterSnap.exists()) {
-        nextId = counterSnap.data().count + 1;
-      }
-      await setDoc(counterRef, { count: nextId });
-      const shortId = `R${nextId}`;
+    }
+    
+    // Salva l'ID cliente per lo step 2 e avanza
+    setRepairData(prev => ({ ...prev, customerId: customerId, customerName: selectedCustomer?.name || newCustomer.name }));
+    setStep(2);
+  };
 
-      // 3. Crea il ticket
-      const ticketsCol = collection(dbUserRef, 'tickets');
-      const finalTicketData = {
-        ...deviceData,
-        customerId: customerId,
-        customerName: selectedCustomerId ? customers.find(c => c.id === customerId)?.name : newCustomer.name, // Denormalizzato per ricerca
-        shortId: shortId,
-        createdBy: appUser.id,
-        // Assicura che i valori numerici siano numeri
-        price: Number(deviceData.price) || 0,
-        deposit: Number(deviceData.deposit) || 0,
+  const handleSubmitRepair = async (e) => {
+    e.preventDefault();
+    if (!repairData.deviceName || !repairData.problemDescription) {
+      showNotify("Dispositivo e Problema sono obbligatori.", "error");
+      return;
+    }
+
+    try {
+      // Genera un ID Ticket univoco (es: MA0001)
+      const prefix = (appUser?.username.substring(0, 2) || 'AA').toUpperCase();
+      // Per un ID univoco reale servirebbe un contatore su Firestore (complesso)
+      // Usiamo un ID più semplice per ora:
+      const ticketId = `${prefix}${Date.now().toString().slice(-6)}`;
+      
+      const fullTicketData = {
+        ...repairData,
+        ticketId: ticketId,
+        price: parseFloat(repairData.price),
+        createdAt: serverTimestamp(),
       };
       
-      const ticketDocRef = await addDoc(ticketsCol, finalTicketData);
+      const docRef = await addDoc(collection(dbUserRef, 'tickets'), fullTicketData);
       
-      // 4. (Opzionale) Se c'è un acconto, crea movimento finanziario
-      if (finalTicketData.deposit > 0) {
-        const financeCol = collection(dbUserRef, 'finance');
-        await addDoc(financeCol, {
-          date: new Date().toISOString().split('T')[0],
-          description: `Acconto Riparazione ID: ${shortId}`,
-          amount: finalTicketData.deposit,
-          type: 'Entrata',
-          ticketId: ticketDocRef.id,
-        });
-      }
+      showNotify("Riparazione creata con successo!", "success");
+      onNavigate('RepairDetail', { ticketId: docRef.id });
 
-      showNotify(`Riparazione ${shortId} creata con successo!`, "success");
-      onNavigate('Riparazioni', ticketDocRef.id); // Vai al dettaglio
-      
     } catch (e) {
-      console.error("Errore creazione ticket:", e);
-      showNotify("Errore durante la creazione del ticket.", "error");
+      console.error("Errore creazione riparazione:", e);
+      showNotify("Errore creazione riparazione.", "error");
     }
   };
-  
-  const getCustomer = () => {
-    if (selectedCustomerId) return customers.find(c => c.id === selectedCustomerId);
-    if (!selectedCustomerId && newCustomer.name) return newCustomer;
-    return null;
-  };
 
-  return (
-    <div className="p-6">
-      <h2 className="text-2xl font-semibold text-gray-900 mb-6">Crea Nuova Riparazione</h2>
-      
-      {/* Stepper */}
-      <div className="mb-8">
-        <ol className="flex items-center w-full text-sm font-medium text-center text-gray-500">
-          <li className={`flex md:w-full items-center ${step >= 1 ? 'text-blue-600' : ''} after:content-[''] after:w-full after:h-1 after:border-b ${step > 1 ? 'after:border-blue-600' : 'after:border-gray-200'} after:border-1 after:hidden sm:after:inline-block after:mx-6 xl:after:mx-10`}>
-            <span className="flex items-center after:content-['/'] sm:after:hidden after:mx-2 after:text-gray-200">
-              {step > 1 ? <CheckSquare className="w-4 h-4 mr-2" /> : <span className="mr-2">1</span>}
-              Cliente
-            </span>
-          </li>
-          <li className={`flex md:w-full items-center ${step >= 2 ? 'text-blue-600' : ''} after:content-[''] after:w-full after:h-1 after:border-b ${step > 2 ? 'after:border-blue-600' : 'after:border-gray-200'} after:border-1 after:hidden sm:after:inline-block after:mx-6 xl:after:mx-10`}>
-            <span className="flex items-center after:content-['/'] sm:after:hidden after:mx-2 after:text-gray-200">
-              {step > 2 ? <CheckSquare className="w-4 h-4 mr-2" /> : <span className="mr-2">2</span>}
-              Dispositivo
-            </span>
-          </li>
-          <li className={`flex items-center ${step >= 3 ? 'text-blue-600' : ''}`}>
-            <span className="mr-2">3</span>
-            Riepilogo
-          </li>
-        </ol>
-      </div>
-      
-      <div className="max-w-3xl mx-auto bg-white p-8 rounded-lg shadow-md">
+  // Step 1: Selezione/Creazione Cliente
+  if (step === 1) {
+    return (
+      <div className="p-6 max-w-2xl mx-auto">
+        <h2 className="text-2xl font-semibold text-white mb-6">Nuova Riparazione (1/2): Cliente</h2>
         
-        {/* Step 1: Cliente */}
-        {step === 1 && (
-          <div>
-            <h3 className="text-lg font-semibold mb-4">Step 1: Seleziona o Crea Cliente</h3>
-            
-            <label className="block text-gray-700 mb-2">Cerca Cliente Esistente</label>
-            <select
-              value={selectedCustomerId || ''}
-              onChange={(e) => {
-                setSelectedCustomerId(e.target.value);
-                setNewCustomer({ name: '', phone: '', email: '', address: '' }); // Resetta form nuovo
-              }}
-              className="w-full p-2 border rounded bg-white mb-4"
-              disabled={loadingCustomers}
-            >
-              <option value="">{loadingCustomers ? 'Caricamento...' : '-- Seleziona un cliente --'}</option>
-              {customers.map(c => (
-                <option key={c.id} value={c.id}>{c.name} ({c.phone})</option>
-              ))}
-            </select>
-            
-            <div className="flex items-center my-4">
-              <div className="flex-grow border-t border-gray-300"></div>
-              <span className="flex-shrink mx-4 text-gray-500">OPPURE</span>
-              <div className="flex-grow border-t border-gray-300"></div>
+        {/* Cerca Cliente Esistente */}
+        <div className="bg-gray-800 rounded-lg shadow p-5 mb-6">
+          <h3 className="text-lg font-semibold text-white mb-4">Cerca Cliente Esistente</h3>
+          <input
+            type="text"
+            placeholder="Cerca per nome o telefono..."
+            value={searchTerm}
+            onChange={(e) => {
+              setSearchTerm(e.target.value);
+              setSelectedCustomer(null); // Resetta se si cerca
+            }}
+            className="w-full bg-gray-700 text-white px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          {searchTerm && !selectedCustomer && (
+            <div className="mt-2 bg-gray-900 rounded-lg max-h-40 overflow-y-auto">
+              {loadingCustomers ? <p className="p-3 text-gray-500">Caricamento...</p> :
+                filteredCustomers.map(c => (
+                  <button
+                    key={c.id}
+                    onClick={() => selectCustomer(c)}
+                    className="block w-full text-left p-3 hover:bg-gray-700"
+                  >
+                    {c.name} - {c.phone}
+                  </button>
+                ))
+              }
+              {filteredCustomers.length === 0 && !loadingCustomers && (
+                <p className="p-3 text-gray-500">Nessun cliente trovato. Creane uno nuovo.</p>
+              )}
             </div>
-            
-            <h4 className="font-semibold mb-2">Crea Nuovo Cliente</h4>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <input type="text" name="name" placeholder="Nome Completo *" value={newCustomer.name} onChange={handleNewCustomerChange} className="w-full p-2 border rounded" disabled={!!selectedCustomerId} />
-              <input type="tel" name="phone" placeholder="Telefono *" value={newCustomer.phone} onChange={handleNewCustomerChange} className="w-full p-2 border rounded" disabled={!!selectedCustomerId} />
-              <input type="email" name="email" placeholder="Email" value={newCustomer.email} onChange={handleNewCustomerChange} className="w-full p-2 border rounded" disabled={!!selectedCustomerId} />
-              <input type="text" name="address" placeholder="Indirizzo" value={newCustomer.address} onChange={handleNewCustomerChange} className="w-full p-2 border rounded" disabled={!!selectedCustomerId} />
+          )}
+          {selectedCustomer && (
+            <p className="mt-3 text-green-400">Cliente selezionato: {selectedCustomer.name}</p>
+          )}
+        </div>
+        
+        {/* O Crea Nuovo Cliente */}
+        <div className="bg-gray-800 rounded-lg shadow p-5">
+          <h3 className="text-lg font-semibold text-white mb-4">Oppure Creane Uno Nuovo</h3>
+          <div className="space-y-4">
+            <div>
+              <label htmlFor="name" className="block text-sm font-medium text-gray-300">Nome Completo *</label>
+              <input type="text" name="name" id="name" value={newCustomer.name} onChange={handleCustomerChange} disabled={!!selectedCustomer} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg disabled:opacity-50" />
             </div>
-            
-            <div className="flex justify-end mt-6">
-              <button 
-                onClick={() => setStep(2)} 
-                disabled={!selectedCustomerId && !newCustomer.name}
-                className="py-2 px-6 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300"
-              >
-                Avanti
-              </button>
+            <div>
+              <label htmlFor="phone" className="block text-sm font-medium text-gray-300">Telefono *</label>
+              <input type="tel" name="phone" id="phone" value={newCustomer.phone} onChange={handleCustomerChange} disabled={!!selectedCustomer} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg disabled:opacity-50" />
+            </div>
+            <div>
+              <label htmlFor="email" className="block text-sm font-medium text-gray-300">Email</label>
+              <input type="email" name="email" id="email" value={newCustomer.email} onChange={handleCustomerChange} disabled={!!selectedCustomer} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg disabled:opacity-50" />
             </div>
           </div>
-        )}
+        </div>
         
-        {/* Step 2: Dispositivo */}
-        {step === 2 && (
+        <button
+          onClick={goToStep2}
+          disabled={!selectedCustomer && (!newCustomer.name || !newCustomer.phone)}
+          className="w-full mt-6 py-3 px-4 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:bg-gray-600"
+        >
+          Avanti
+        </button>
+      </div>
+    );
+  }
+
+  // Step 2: Dettagli Riparazione
+  return (
+    <div className="p-6 max-w-2xl mx-auto">
+      <button onClick={() => setStep(1)} className="flex items-center text-sm text-blue-400 hover:text-blue-300 mb-4">
+        <ArrowLeft size={16} className="mr-1" />
+        Torna al Cliente
+      </button>
+      <h2 className="text-2xl font-semibold text-white mb-6">Nuova Riparazione (2/2): Dispositivo</h2>
+      <p className="text-gray-400 mb-4">Cliente: {repairData.customerName}</p>
+      
+      <form onSubmit={handleSubmitRepair} className="bg-gray-800 rounded-lg shadow p-6 space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <h3 className="text-lg font-semibold mb-4">Step 2: Dettagli Dispositivo e Riparazione</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <input type="text" name="deviceModel" placeholder="Modello Dispositivo *" value={deviceData.deviceModel} onChange={handleDeviceChange} className="w-full p-2 border rounded md:col-span-2" required />
-              <input type="text" name="imei" placeholder="IMEI / Seriale" value={deviceData.imei} onChange={handleDeviceChange} className="w-full p-2 border rounded" />
-              <input type="text" name="devicePin" placeholder="PIN / Password Sblocco" value={deviceData.devicePin} onChange={handleDeviceChange} className="w-full p-2 border rounded" />
-            </div>
-            
-            <textarea name="problem" placeholder="Problema Segnalato *" value={deviceData.problem} onChange={handleDeviceChange} className="w-full p-2 border rounded mt-4" rows="3" required></textarea>
-            <textarea name="internalNotes" placeholder="Note Interne (opzionale)" value={deviceData.internalNotes} onChange={handleDeviceChange} className="w-full p-2 border rounded mt-4" rows="3"></textarea>
-            
-            <hr className="my-6" />
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <input type="number" name="price" placeholder="Preventivo (€)" value={deviceData.price} onChange={handleDeviceChange} className="w-full p-2 border rounded" />
-              <input type="number" name="deposit" placeholder="Acconto (€)" value={deviceData.deposit} onChange={handleDeviceChange} className="w-full p-2 border rounded" />
-              <select name="assignedTo" value={deviceData.assignedTo} onChange={handleDeviceChange} className="w-full p-2 border rounded bg-white">
-                <option value="">Assegna a...</option>
-                {technicians.map(t => <option key={t.id} value={t.id}>{t.username}</option>)}
+            <label htmlFor="deviceName" className="block text-sm font-medium text-gray-300">Dispositivo *</label>
+            <input type="text" name="deviceName" id="deviceName" value={repairData.deviceName} onChange={handleRepairChange} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg" />
+          </div>
+          <div>
+            <label htmlFor="imei" className="block text-sm font-medium text-gray-300">IMEI / Seriale</label>
+            <input type="text" name="imei" id="imei" value={repairData.imei} onChange={handleRepairChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg" />
+          </div>
+          <div>
+            <label htmlFor="password" className="block text-sm font-medium text-gray-300">Password Sblocco</label>
+            <input type="text" name="password" id="password" value={repairData.password} onChange={handleRepairChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg" />
+          </div>
+          <div>
+            <label htmlFor="price" className="block text-sm font-medium text-gray-300">Prezzo Iniziale</label>
+            <input type="number" step="0.01" name="price" id="price" value={repairData.price} onChange={handleRepairChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg" />
+          </div>
+          {appUser.role === 'Owner' && (
+             <div>
+              <label htmlFor="technician" className="block text-sm font-medium text-gray-300">Assegna a Tecnico</label>
+              <select name="technician" id="technician" value={repairData.technician} onChange={handleRepairChange} className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg">
+                <option value={appUser.username}>{appUser.username} (Tu)</option>
+                {technicians.filter(t => t.username !== appUser.username).map(tech => (
+                  <option key={tech.id} value={tech.username}>{tech.username}</option>
+                ))}
               </select>
             </div>
-
-            <div className="flex justify-between mt-6">
-              <button onClick={() => setStep(1)} className="py-2 px-6 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">
-                Indietro
-              </button>
-              <button 
-                onClick={() => setStep(3)} 
-                disabled={!deviceData.deviceModel || !deviceData.problem}
-                className="py-2 px-6 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300"
-              >
-                Riepilogo
-              </button>
-            </div>
-          </div>
-        )}
-        
-        {/* Step 3: Riepilogo */}
-        {step === 3 && (
-          <div>
-            <h3 className="text-lg font-semibold mb-4">Step 3: Riepilogo e Conferma</h3>
-            <div className="space-y-4 text-sm">
-              <div className="p-4 bg-gray-50 rounded-md">
-                <h4 className="font-bold">Cliente:</h4>
-                <p>{getCustomer()?.name} ({getCustomer()?.phone})</p>
-              </div>
-              <div className="p-4 bg-gray-50 rounded-md">
-                <h4 className="font-bold">Dispositivo:</h4>
-                <p>{deviceData.deviceModel} (IMEI: {deviceData.imei || 'N/D'})</p>
-                <p><strong>Problema:</strong> {deviceData.problem}</p>
-              </div>
-              <div className="p-4 bg-gray-50 rounded-md">
-                <h4 className="font-bold">Dettagli:</h4>
-                <p><strong>Preventivo:</strong> €{deviceData.price || 0}</p>
-                <p><strong>Acconto:</strong> €{deviceData.deposit || 0}</p>
-                <p><strong>Tecnico:</strong> {technicians.find(t => t.id === deviceData.assignedTo)?.username || 'Non assegnato'}</p>
-              </div>
-            </div>
-            
-            <div className="flex justify-between mt-6">
-              <button onClick={() => setStep(2)} className="py-2 px-6 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300">
-                Indietro
-              </button>
-              <button 
-                onClick={handleCreateTicket} 
-                className="py-2 px-6 bg-green-600 text-white rounded-lg hover:bg-green-700"
-              >
-                Crea Riparazione
-              </button>
-            </div>
-          </div>
-        )}
-        
-      </div>
+          )}
+        </div>
+        <div>
+          <label htmlFor="problemDescription" className="block text-sm font-medium text-gray-300">Problema Segnalato *</label>
+          <textarea name="problemDescription" id="problemDescription" value={repairData.problemDescription} onChange={handleRepairChange} rows={4} required className="w-full mt-1 bg-gray-700 text-white px-3 py-2 rounded-lg"></textarea>
+        </div>
+        <button
+          type="submit"
+          className="w-full mt-6 py-3 px-4 rounded-lg bg-green-600 text-white font-medium hover:bg-green-700"
+        >
+          Crea Riparazione
+        </button>
+      </form>
     </div>
   );
 };
@@ -2357,15 +2140,26 @@ const NewRepairForm = ({ dbUserRef, appUser, onNavigate, customers, loadingCusto
 
 // Notifiche (Toast)
 const Notification = ({ message, type, onClose }) => {
+  const [visible, setVisible] = useState(false);
+
   useEffect(() => {
-    const timer = setTimeout(onClose, 3000); // Chiude dopo 3 secondi
+    setVisible(true); // Entra
+    const timer = setTimeout(() => {
+      setVisible(false); // Esce
+      setTimeout(onClose, 300); // Rimuove dopo transizione
+    }, 3000);
+    
     return () => clearTimeout(timer);
   }, [onClose]);
 
-  const bgColor = type === 'success' ? 'bg-green-500' : 'bg-red-500';
+  const bgColor = type === 'success' ? 'bg-green-600' : (type === 'error' ? 'bg-red-600' : 'bg-blue-600');
 
   return (
-    <div className={`fixed top-5 right-5 ${bgColor} text-white py-2 px-4 rounded-lg shadow-lg z-50`}>
+    <div
+      className={`fixed top-5 right-5 z-50 p-4 rounded-lg shadow-lg text-white ${bgColor} transition-all duration-300 ${
+        visible ? 'opacity-100 translate-x-0' : 'opacity-0 translate-x-10'
+      }`}
+    >
       {message}
     </div>
   );
@@ -2376,12 +2170,11 @@ const useAllAdmins = (dbUserRef) => {
   const [admins, setAdmins] = useState([]);
   useEffect(() => {
     if (!dbUserRef) return;
-    const usersCol = collection(dbUserRef, 'managedUsers');
-    const q = query(usersCol, where("role", "in", ["Owner", "Admin"]));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setAdmins(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    const q = query(collection(dbUserRef, 'users'), where('role', 'in', ['Owner', 'Admin']));
+    const unsub = onSnapshot(q, (snapshot) => {
+      setAdmins(snapshot.docs.map(d => d.data()));
     });
-    return () => unsubscribe();
+    return () => unsub();
   }, [dbUserRef]);
   return admins;
 };
@@ -2390,74 +2183,79 @@ const useAllAdmins = (dbUserRef) => {
 
 // 1. Creiamo un componente "figlio" che consumerà il contesto
 function AppContent() {
-  // Ora useContext(AuthContext) funzionerà, perché è DENTRO il Provider
-  const { authReady, appUser, loading, error, login, logout, dbUserRef } = useContext(AuthContext);
-
+  const { authReady, appUser, login, error, loading, dbUserRef } = useContext(AuthContext);
+  
+  // Stato di navigazione
   const [currentView, setCurrentView] = useState('Dashboard');
-  const [detailId, setDetailId] = useState(null); // Per dettaglio riparazione
-  const [notification, setNotification] = useState(null); // {message, type}
+  const [viewParams, setViewParams] = useState(null);
   
-  // Hooks Dati
-  const { customers, loadingCustomers } = useCustomers(dbUserRef);
-  const allAdmins = useAllAdmins(dbUserRef); // Carica tutti gli admin/owner
-  const { technicians, loading: loadingTechnicians } = useTechnicians(dbUserRef, appUser || {}); // {} per evitare errori al logout
-
-  const showNotify = (message, type = 'success') => {
-    setNotification({ message, type });
+  // Stato notifiche
+  const [notification, setNotification] = useState(null);
+  
+  // Hooks dati globali
+  const { customers, loading: loadingCustomers } = useCustomers(dbUserRef);
+  const { technicians, loading: loadingTechnicians } = useTechnicians(dbUserRef, appUser);
+  const allAdmins = useAllAdmins(dbUserRef);
+  
+  const showNotify = (message, type = 'info') => {
+    setNotification({ id: Date.now(), message, type });
   };
-  
-  const handleNavigate = (view, id = null) => {
+
+  const handleNavigate = (view, params = null) => {
     setCurrentView(view);
-    setDetailId(id);
+    setViewParams(params);
   };
-
-  if (!authReady || loading) {
+  
+  // Mostra caricamento finché Firebase non è pronto
+  if (!authReady) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-50">
-        <div className="loader text-gray-700">Caricamento...</div>
+      <div className="flex items-center justify-center min-h-screen bg-gray-900">
+        <svg className="animate-spin h-10 w-10 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
       </div>
     );
   }
 
+  // Se Firebase è pronto ma non c'è login, mostra LoginScreen
   if (!appUser) {
     return <LoginScreen onLogin={login} error={error} loading={loading} />;
   }
-  
+
   // Se loggato, renderizza l'app principale
   const renderView = () => {
-    if (detailId && currentView === 'Riparazioni') {
-      return <RepairDetailView 
-                ticketId={detailId} 
-                onNavigate={handleNavigate} 
-                dbUserRef={dbUserRef}
-                appUser={appUser}
-                customers={customers}
-                technicians={technicians}
-                showNotify={showNotify}
-                settings={{}} // Aggiungi impostazioni se necessario
-              />;
-    }
-    
     switch (currentView) {
       case 'Dashboard':
         return <DashboardView 
                   dbUserRef={dbUserRef} 
                   appUser={appUser} 
-                  managedUsers={allAdmins} // managedUsers ora sono gli admin per la logica ticket
+                  managedUsers={technicians} // Passa tecnici come utenti gestiti
                   onNavigate={handleNavigate} 
-                  allAdmins={allAdmins}
+                  allAdmins={allAdmins} 
                   customers={customers}
                   loadingCustomers={loadingCustomers}
                 />;
       case 'Riparazioni':
         return <RepairView 
-                  dbUserRef={dbUserRef}
-                  appUser={appUser}
-                  onNavigate={handleNavigate}
+                  dbUserRef={dbUserRef} 
+                  appUser={appUser} 
+                  onNavigate={handleNavigate} 
                   technicians={technicians}
                   allAdmins={allAdmins}
                   customers={customers}
                   loadingCustomers={loadingCustomers}
+                />;
+      case 'RepairDetail':
+        return <RepairDetailView
+                  ticketId={viewParams.ticketId}
+                  onNavigate={handleNavigate}
+                  dbUserRef={dbUserRef}
+                  appUser={appUser}
+                  customers={customers}
+                  technicians={technicians}
+                  showNotify={showNotify}
+                  settings={null} // Da implementare se necessario
                 />;
       case 'Clienti':
         return <CustomerView 
@@ -2466,19 +2264,43 @@ function AppContent() {
                   customers={customers}
                   loadingCustomers={loadingCustomers}
                 />;
+      case 'CustomerEdit':
+        const customer = viewParams?.customerId ? customers.find(c => c.id === viewParams.customerId) : null;
+        return <CustomerForm
+                  customer={customer}
+                  onSave={async (formData) => {
+                    try {
+                      if (customer) {
+                        // Modifica
+                        await updateDoc(doc(dbUserRef, 'customers', customer.id), formData);
+                      } else {
+                        // Nuovo
+                        await addDoc(collection(dbUserRef, 'customers'), {
+                          ...formData,
+                          createdAt: serverTimestamp()
+                        });
+                      }
+                      showNotify("Cliente salvato!", "success");
+                      onNavigate('Clienti');
+                    } catch (e) {
+                      showNotify("Errore salvataggio cliente", "error");
+                    }
+                  }}
+                  onCancel={() => onNavigate('Clienti')}
+                />;
       case 'Finanze':
         return <FinanceView 
                   dbUserRef={dbUserRef}
                   appUser={appUser}
-                  managedUsers={allAdmins}
+                  managedUsers={technicians}
                 />;
       case 'Impostazioni':
         return <SettingsView 
                   dbUserRef={dbUserRef}
                   appUser={appUser}
                 />;
-      case 'Nuova Riparazione':
-        return <NewRepairForm 
+      case 'NewRepair':
+        return <NewRepairForm
                   dbUserRef={dbUserRef}
                   appUser={appUser}
                   onNavigate={handleNavigate}
@@ -2491,7 +2313,7 @@ function AppContent() {
         return <DashboardView 
                   dbUserRef={dbUserRef} 
                   appUser={appUser} 
-                  managedUsers={allAdmins} 
+                  managedUsers={technicians}
                   onNavigate={handleNavigate} 
                   allAdmins={allAdmins}
                   customers={customers}
@@ -2501,7 +2323,7 @@ function AppContent() {
   };
 
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex h-screen bg-gray-900 text-gray-100">
       {notification && (
         <Notification
           message={notification.message}
@@ -2510,25 +2332,17 @@ function AppContent() {
         />
       )}
       
-      {/* Sidebar (solo desktop) */}
-      <div className="hidden lg:block">
-        <Sidebar
-          currentView={currentView}
-          onNavigate={handleNavigate}
-          onLogout={logout}
-          appUser={appUser}
-        />
-      </div>
-
-      {/* Header (solo mobile) - DA IMPLEMENTARE */}
-      {/* <Header onToggleSidebar={() => {}} /> */}
+      <Sidebar
+        currentView={currentView}
+        onNavigate={handleNavigate}
+        onLogout={useContext(AuthContext).logout}
+        appUser={appUser}
+      />
       
-      {/* Contenuto Principale */}
-      <main className="flex-1 lg:ml-64 overflow-y-auto">
-        {/* Padding per header mobile (se ci fosse) */}
-        {/* <div className="lg:hidden pt-16"></div> */}
-        
-        {renderView()}
+      <main className="flex-1 md:ml-64 flex flex-col overflow-y-auto bg-gray-950">
+        <div className="pt-16 md:pt-0"> {/* Padding top per header mobile */}
+          {renderView()}
+        </div>
       </main>
     </div>
   );
@@ -2537,11 +2351,10 @@ function AppContent() {
 
 // 2. L'export di default è il "Provider" che carica i dati
 export default function App() {
-  // Chiamiamo il nostro hook che prepara tutti i dati di autenticazione
-  const authData = useAuth();
+  const authData = useAuth(); // Esegui l'hook
 
-  // Forniamo i dati (authData) a tutti i componenti figli
   return (
+    // Fornisci i dati di autenticazione all'intera app
     <AuthContext.Provider value={authData}>
       <AppContent /> 
     </AuthContext.Provider>
