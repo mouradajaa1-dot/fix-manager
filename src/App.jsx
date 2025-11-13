@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, createContext, useContext, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
+// ... (tutti gli altri import di firebase e lucide) ...
 import { 
   getAuth, 
   onAuthStateChanged, 
   signInAnonymously,
-  signInWithCustomToken
+  signInWithCustomToken // <-- RIPRISTINATO
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -55,27 +56,25 @@ import {
   Receipt
 } from 'lucide-react';
 
-// --- CONFIGURAZIONE FIREBASE ---
-// Leggiamo la configurazione dalle Variabili d'Ambiente
-// VITE_FIREBASE_CONFIG_JSON è il nome della variabile che creeremo in Vercel.
-const firebaseConfigJson = import.meta.env.VITE_FIREBASE_CONFIG_JSON;
-let firebaseConfig = {};
 
-if (firebaseConfigJson) {
-  try {
-    firebaseConfig = JSON.parse(firebaseConfigJson);
-  } catch (e) {
-    console.error("Errore nel parsing della configurazione Firebase dalle variabili d'ambiente", e);
-  }
-} else {
-  console.error("Variabile d'ambiente VITE_FIREBASE_CONFIG_JSON non trovata!");
-}
+// --- CONFIGURAZIONE FIREBASE ---
+// *** MODIFICATO: Inserita la tua chiave Firebase direttamente ***
+const firebaseConfig = {
+  apiKey: "AIzaSyA6CPWS6ynAU78JnUVKFSU7k1IyONN3jPk",
+  authDomain: "fixmanager-f6821.firebaseapp.com",
+  projectId: "fixmanager-f6821",
+  storageBucket: "fixmanager-f6821.firebasestorage.app",
+  messagingSenderId: "165228137867",
+  appId: "1:165228137867:web:0e381e99c97c3c4604338e",
+  measurementId: "G-EBE2Z8FPYC"
+};
+// --- FINE MODIFICA ---
 
 const appId = firebaseConfig.projectId || 'default-app-id';
 
 let db;
 let auth;
-
+// ... (codice try/catch per initializeApp) ...
 try {
   const app = initializeApp(firebaseConfig);
   db = getFirestore(app);
@@ -89,24 +88,27 @@ try {
 const AuthContext = createContext(null);
 
 const useAuth = () => {
-  const [authReady, setAuthReady] = useState(false);
-  const [currentUser, setCurrentUser] = useState(null); // Utente Firebase
-  const [appUser, setAppUser] = useState(null); // Utente (Owner/Admin/Tecnico)
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+// ... (codice interno di useAuth) ...
   const [dbUserRef, setDbUserRef] = useState(null);
 
   useEffect(() => {
-    // Usiamo solo l'accesso anonimo
+    // *** MODIFICATO: Ripristinato metodo di auth per questo ambiente ***
     const performAuth = async () => {
       try {
-        await signInAnonymously(auth);
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
       } catch (e) {
-        console.error("Errore di autenticazione anonima:", e);
+        console.error("Errore di autenticazione:", e);
         setError("Errore di autenticazione.");
       }
     };
+    // --- FINE MODIFICA ---
 
+    // *** INIZIO BLOCCO CORRETTO ***
+    // Sostituito il blocco onAuthStateChanged danneggiato
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setCurrentUser(user);
@@ -129,6 +131,7 @@ const useAuth = () => {
       setAuthReady(true);
       setLoading(false);
     });
+    // *** FINE BLOCCO CORRETTO ***
 
     performAuth();
     return () => unsubscribe();
